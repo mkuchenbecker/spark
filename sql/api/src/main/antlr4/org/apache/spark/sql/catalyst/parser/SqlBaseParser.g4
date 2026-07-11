@@ -417,7 +417,7 @@ statement
         LEFT_PAREN
         (functionArgument (COMMA functionArgument)*)?
         RIGHT_PAREN                                                    #call
-    | VACUUM identifierReference ofd=OFD?
+    | VACUUM identifierReference (remove=REMOVE ORPHANED FILES)?
         (RETAIN retainHours=INTEGER_VALUE HOURS)?                      #vacuumTable
     | unsupportedHiveNativeCommands .*?                                #failNativeCommand
     | createPipelineDatasetHeader (LEFT_PAREN tableElementList? RIGHT_PAREN)? tableProvider?
@@ -2118,6 +2118,7 @@ ansiNonReserved
     | EXTRACT
     | FIELDS
     | FILEFORMAT
+    | FILES
     | FIRST
     | FLOAT
     | FLOW
@@ -2210,10 +2211,10 @@ ansiNonReserved
     | NULLS
     | NUMERIC
     | OF
-    | OFD
     | OPEN
     | OPTION
     | OPTIONS
+    | ORPHANED
     | OUT
     | OUTPUTFORMAT
     | OVER
@@ -2247,6 +2248,7 @@ ansiNonReserved
     | REDUCE
     | REFRESH
     | RELY
+    | REMOVE
     | RENAME
     | REPAIR
     | REPEAT
@@ -2539,6 +2541,7 @@ nonReserved
     | FILTER
     | FIELDS
     | FILEFORMAT
+    | FILES
     | FIRST
     | FLOAT
     | FLOW
@@ -2645,7 +2648,6 @@ nonReserved
     | NULLS
     | NUMERIC
     | OF
-    | OFD
     | OFFSET
     | ONLY
     | OPEN
@@ -2653,6 +2655,7 @@ nonReserved
     | OPTIONS
     | OR
     | ORDER
+    | ORPHANED
     | OUT
     | OUTER
     | OUTPUTFORMAT
@@ -2691,6 +2694,7 @@ nonReserved
     | REFERENCES
     | REFRESH
     | RELY
+    | REMOVE
     | RENAME
     | REPAIR
     | REPEAT

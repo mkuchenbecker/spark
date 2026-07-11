@@ -28,7 +28,7 @@ class VacuumTableSuite extends SparkFunSuite {
       Seq("CALL cat.system.expire_snapshots(table => 'db.t')"))
   }
 
-  test("callStatements: OFD appends remove_orphan_files after expiration") {
+  test("callStatements: removeOrphanFiles appends remove_orphan_files after expiration") {
     assert(
       VacuumTableCommand.callStatements(
         "cat", Seq("db", "t"), removeOrphanFiles = true, olderThan = None) ===
