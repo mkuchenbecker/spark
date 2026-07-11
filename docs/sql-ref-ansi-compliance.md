@@ -664,6 +664,11 @@ Below is a list of all the keywords in Spark SQL.
 |USE|non-reserved|non-reserved|non-reserved|
 |USER|reserved|non-reserved|reserved|
 |USING|reserved|strict-non-reserved|reserved|
+|FILES|non-reserved|non-reserved|non-reserved|
+|ORPHAN|non-reserved|non-reserved|non-reserved|
+|REMOVE|non-reserved|non-reserved|non-reserved|
+|RETAIN|non-reserved|non-reserved|non-reserved|
+|VACUUM|non-reserved|non-reserved|non-reserved|
 |VALUES|non-reserved|non-reserved|reserved|
 |VARCHAR|non-reserved|non-reserved|reserved|
 |VERSION|non-reserved|non-reserved|non-reserved|
