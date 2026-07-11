@@ -35,6 +35,14 @@
   </properties>
 
   <dependencies>
+    <!-- Test-only: real Apache Iceberg runtime to exercise VACUUM end-to-end.
+         expire_snapshots / remove_orphan_files behavior matches the LinkedIn custom build. -->
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-spark-runtime-3.5_${scala.binary.version}</artifactId>
+      <version>1.5.2</version>
+      <scope>test</scope>
+    </dependency>
     <dependency>
       <groupId>org.rocksdb</groupId>
       <artifactId>rocksdbjni</artifactId>
