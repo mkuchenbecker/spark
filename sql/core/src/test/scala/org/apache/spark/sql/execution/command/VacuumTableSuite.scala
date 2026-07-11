@@ -24,34 +24,35 @@ class VacuumTableSuite extends SparkFunSuite {
   test("callStatements: snapshot expiration only, default retention") {
     assert(
       VacuumTableCommand.callStatements(
-        "cat", Seq("db", "t"), removeOrphanFiles = false, retainHours = None) ===
+        "cat", Seq("db", "t"), removeOrphanFiles = false, olderThan = None) ===
       Seq("CALL cat.system.expire_snapshots(table => 'db.t')"))
   }
 
   test("callStatements: OFD appends remove_orphan_files after expiration") {
     assert(
       VacuumTableCommand.callStatements(
-        "cat", Seq("db", "t"), removeOrphanFiles = true, retainHours = None) ===
+        "cat", Seq("db", "t"), removeOrphanFiles = true, olderThan = None) ===
       Seq(
         "CALL cat.system.expire_snapshots(table => 'db.t')",
         "CALL cat.system.remove_orphan_files(table => 'db.t')"))
   }
 
-  test("callStatements: RETAIN bounds both operations via older_than") {
+  test("callStatements: older_than bounds both operations via a literal timestamp") {
     assert(
       VacuumTableCommand.callStatements(
-        "cat", Seq("db", "t"), removeOrphanFiles = true, retainHours = Some(168)) ===
+        "cat", Seq("db", "t"), removeOrphanFiles = true,
+        olderThan = Some("2026-01-01 00:00:00")) ===
       Seq(
         "CALL cat.system.expire_snapshots(table => 'db.t'," +
-          " older_than => current_timestamp() - INTERVAL 168 HOURS)",
+          " older_than => TIMESTAMP '2026-01-01 00:00:00')",
         "CALL cat.system.remove_orphan_files(table => 'db.t'," +
-          " older_than => current_timestamp() - INTERVAL 168 HOURS)"))
+          " older_than => TIMESTAMP '2026-01-01 00:00:00')"))
   }
 
   test("callStatements: quotes the catalog identifier when required") {
     assert(
       VacuumTableCommand.callStatements(
-        "my-cat", Seq("t"), removeOrphanFiles = false, retainHours = None) ===
+        "my-cat", Seq("t"), removeOrphanFiles = false, olderThan = None) ===
       Seq("CALL `my-cat`.system.expire_snapshots(table => 't')"))
   }
 }

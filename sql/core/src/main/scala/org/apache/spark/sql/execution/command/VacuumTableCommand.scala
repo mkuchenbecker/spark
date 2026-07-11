@@ -17,6 +17,10 @@
 
 package org.apache.spark.sql.execution.command
 
+import java.time.{Instant, ZoneId}
+import java.time.format.DateTimeFormatter
+import java.time.temporal.ChronoUnit
+
 import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.catalyst.util.quoteIfNeeded
 
@@ -50,34 +54,45 @@ case class VacuumTableCommand(
       case _ =>
         (catalogManager.currentCatalog.name, nameParts)
     }
-    VacuumTableCommand.callStatements(catalog, table, removeOrphanFiles, retainHours)
+    // Procedure arguments must be foldable, so a RETAIN window is resolved here to a
+    // literal timestamp (now - n hours) in the session time zone rather than passed as
+    // a `current_timestamp()` expression, which the CALL binding rejects.
+    val olderThan = retainHours.map { hours =>
+      val zone = ZoneId.of(sparkSession.sessionState.conf.sessionLocalTimeZone)
+      val cutoff = Instant.now().minus(hours.toLong, ChronoUnit.HOURS)
+      VacuumTableCommand.timestampFormatter.withZone(zone).format(cutoff)
+    }
+    VacuumTableCommand.callStatements(catalog, table, removeOrphanFiles, olderThan)
       .foreach(stmt => sparkSession.sql(stmt).collect())
     Seq.empty[Row]
   }
 }
 
 object VacuumTableCommand {
+  private val timestampFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
+
   /**
    * Builds the `CALL` statements that a VACUUM invocation expands into. Snapshot
    * expiration is always emitted first; orphan-file deletion is appended when requested
-   * so it runs after expiration has settled the live file set. Exposed for testing.
+   * so it runs after expiration has settled the live file set. `olderThan`, when set, is
+   * a literal timestamp string that bounds both operations via the procedures'
+   * `older_than` argument. Exposed for testing.
    */
   def callStatements(
       catalog: String,
       table: Seq[String],
       removeOrphanFiles: Boolean,
-      retainHours: Option[Int]): Seq[String] = {
+      olderThan: Option[String]): Seq[String] = {
     val cat = quoteIfNeeded(catalog)
     val tableArg = table.map(quoteIfNeeded).mkString(".")
-    val olderThan = retainHours
-      .map(h => s", older_than => current_timestamp() - INTERVAL $h HOURS")
-      .getOrElse("")
+    val olderThanArg =
+      olderThan.map(ts => s", older_than => TIMESTAMP '$ts'").getOrElse("")
     val expireSnapshots =
-      s"CALL $cat.system.expire_snapshots(table => '$tableArg'$olderThan)"
+      s"CALL $cat.system.expire_snapshots(table => '$tableArg'$olderThanArg)"
     if (removeOrphanFiles) {
       Seq(
         expireSnapshots,
-        s"CALL $cat.system.remove_orphan_files(table => '$tableArg'$olderThan)")
+        s"CALL $cat.system.remove_orphan_files(table => '$tableArg'$olderThanArg)")
     } else {
       Seq(expireSnapshots)
     }
