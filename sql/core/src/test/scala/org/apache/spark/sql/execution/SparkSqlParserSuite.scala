@@ -1281,4 +1281,15 @@ class SparkSqlParserSuite extends AnalysisTest with SharedSparkSession {
       assert(result.partialStatement.isEmpty)
     }
   }
+
+  test("VACUUM table") {
+    assertEqual("VACUUM a.b.c",
+      VacuumTableCommand(Seq("a", "b", "c"), removeOrphanFiles = false, retainHours = None))
+    assertEqual("VACUUM tbl OFD",
+      VacuumTableCommand(Seq("tbl"), removeOrphanFiles = true, retainHours = None))
+    assertEqual("VACUUM tbl RETAIN 24 HOURS",
+      VacuumTableCommand(Seq("tbl"), removeOrphanFiles = false, retainHours = Some(24)))
+    assertEqual("VACUUM a.b OFD RETAIN 168 HOURS",
+      VacuumTableCommand(Seq("a", "b"), removeOrphanFiles = true, retainHours = Some(168)))
+  }
 }

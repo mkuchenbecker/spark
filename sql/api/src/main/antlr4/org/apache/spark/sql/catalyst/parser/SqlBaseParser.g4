@@ -417,6 +417,8 @@ statement
         LEFT_PAREN
         (functionArgument (COMMA functionArgument)*)?
         RIGHT_PAREN                                                    #call
+    | VACUUM identifierReference ofd=OFD?
+        (RETAIN retainHours=INTEGER_VALUE HOURS)?                      #vacuumTable
     | unsupportedHiveNativeCommands .*?                                #failNativeCommand
     | createPipelineDatasetHeader (LEFT_PAREN tableElementList? RIGHT_PAREN)? tableProvider?
         createTableClauses
@@ -2208,6 +2210,7 @@ ansiNonReserved
     | NULLS
     | NUMERIC
     | OF
+    | OFD
     | OPEN
     | OPTION
     | OPTIONS
@@ -2252,6 +2255,7 @@ ansiNonReserved
     | RESET
     | RESPECT
     | RESTRICT
+    | RETAIN
     | RETURN
     | RETURNS
     | REVOKE
@@ -2334,6 +2338,7 @@ ansiNonReserved
     | UNTIL
     | UPDATE
     | USE
+    | VACUUM
     | VALUE
     | VALUES
     | VARCHAR
@@ -2640,6 +2645,7 @@ nonReserved
     | NULLS
     | NUMERIC
     | OF
+    | OFD
     | OFFSET
     | ONLY
     | OPEN
@@ -2693,6 +2699,7 @@ nonReserved
     | RESET
     | RESPECT
     | RESTRICT
+    | RETAIN
     | RETURN
     | RETURNS
     | REVOKE
@@ -2785,6 +2792,7 @@ nonReserved
     | UPDATE
     | USE
     | USER
+    | VACUUM
     | VALUE
     | VALUES
     | VARCHAR

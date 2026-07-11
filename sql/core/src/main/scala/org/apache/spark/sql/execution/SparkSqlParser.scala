@@ -1614,6 +1614,19 @@ class SparkSqlAstBuilder extends AstBuilder {
       DescribeProcedureCommand(UnresolvedProcedure(procIdentifier)))
   }
 
+  /**
+   * Create a [[VacuumTableCommand]] logical plan. For example:
+   * {{{
+   *   VACUUM multi_part_name [OFD] [RETAIN number HOURS]
+   * }}}
+   */
+  override def visitVacuumTable(ctx: VacuumTableContext): LogicalPlan = withOrigin(ctx) {
+    val removeOrphanFiles = ctx.ofd != null
+    val retainHours = Option(ctx.retainHours).map(_.getText.toInt)
+    withIdentClause(ctx.identifierReference(), nameParts =>
+      VacuumTableCommand(nameParts, removeOrphanFiles, retainHours))
+  }
+
   override def visitCreatePipelineInsertIntoFlow(
       ctx: CreatePipelineInsertIntoFlowContext): LogicalPlan = withOrigin(ctx) {
     val createPipelineFlowHeaderCtx = ctx.createPipelineFlowHeader()
