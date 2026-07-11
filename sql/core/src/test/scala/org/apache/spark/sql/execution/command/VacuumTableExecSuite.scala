@@ -64,13 +64,13 @@ class VacuumTableExecSuite extends QueryTest with SharedSparkSession with Before
     assert(invocations.toSeq === Seq("expire_snapshots:db.t"))
   }
 
-  test("VACUUM REMOVE ORPHANED FILES runs expiration then orphan-file deletion, in order") {
-    sql("VACUUM cat.db.t REMOVE ORPHANED FILES")
+  test("VACUUM REMOVE ORPHAN FILES runs expiration then orphan-file deletion, in order") {
+    sql("VACUUM cat.db.t REMOVE ORPHAN FILES")
     assert(invocations.toSeq === Seq("expire_snapshots:db.t", "remove_orphan_files:db.t"))
   }
 
-  test("VACUUM REMOVE ORPHANED FILES RETAIN invokes both procedures") {
-    sql("VACUUM cat.db.t REMOVE ORPHANED FILES RETAIN 24 HOURS")
+  test("VACUUM REMOVE ORPHAN FILES RETAIN invokes both procedures") {
+    sql("VACUUM cat.db.t REMOVE ORPHAN FILES RETAIN 24 HOURS")
     assert(invocations.toSeq === Seq("expire_snapshots:db.t", "remove_orphan_files:db.t"))
   }
 

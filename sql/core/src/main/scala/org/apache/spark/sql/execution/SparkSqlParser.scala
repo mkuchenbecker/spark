@@ -1617,7 +1617,7 @@ class SparkSqlAstBuilder extends AstBuilder {
   /**
    * Create a [[VacuumTableCommand]] logical plan. For example:
    * {{{
-   *   VACUUM multi_part_name [REMOVE ORPHANED FILES] [RETAIN number HOURS]
+   *   VACUUM multi_part_name [REMOVE ORPHAN FILES] [RETAIN number HOURS]
    * }}}
    */
   override def visitVacuumTable(ctx: VacuumTableContext): LogicalPlan = withOrigin(ctx) {

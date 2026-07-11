@@ -28,10 +28,10 @@ import org.apache.spark.sql.catalyst.util.quoteIfNeeded
  * The logical plan of the VACUUM command, which runs Iceberg table maintenance by
  * delegating to the catalog's stored procedures. For example:
  * {{{
- *   VACUUM multi_part_name [REMOVE ORPHANED FILES] [RETAIN number HOURS]
+ *   VACUUM multi_part_name [REMOVE ORPHAN FILES] [RETAIN number HOURS]
  * }}}
  *
- * Snapshot expiration always runs. When `REMOVE ORPHANED FILES` is specified, orphan-file
+ * Snapshot expiration always runs. When `REMOVE ORPHAN FILES` is specified, orphan-file
  * deletion runs afterwards. When `RETAIN n HOURS` is specified it bounds both operations via the
  * procedures' `older_than` argument; otherwise each procedure falls back to its own
  * default (the table's snapshot-age property for expiration, and Iceberg's safe

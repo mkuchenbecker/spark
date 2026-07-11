@@ -417,7 +417,7 @@ statement
         LEFT_PAREN
         (functionArgument (COMMA functionArgument)*)?
         RIGHT_PAREN                                                    #call
-    | VACUUM identifierReference (remove=REMOVE ORPHANED FILES)?
+    | VACUUM identifierReference (remove=REMOVE ORPHAN FILES)?
         (RETAIN retainHours=INTEGER_VALUE HOURS)?                      #vacuumTable
     | unsupportedHiveNativeCommands .*?                                #failNativeCommand
     | createPipelineDatasetHeader (LEFT_PAREN tableElementList? RIGHT_PAREN)? tableProvider?
@@ -2214,7 +2214,7 @@ ansiNonReserved
     | OPEN
     | OPTION
     | OPTIONS
-    | ORPHANED
+    | ORPHAN
     | OUT
     | OUTPUTFORMAT
     | OVER
@@ -2655,7 +2655,7 @@ nonReserved
     | OPTIONS
     | OR
     | ORDER
-    | ORPHANED
+    | ORPHAN
     | OUT
     | OUTER
     | OUTPUTFORMAT
