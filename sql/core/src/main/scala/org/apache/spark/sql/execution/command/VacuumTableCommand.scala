@@ -69,7 +69,7 @@ case class VacuumTableCommand(
 }
 
 object VacuumTableCommand {
-  private val timestampFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
+  private val timestampFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
 
   /**
    * Builds the `CALL` statements that a VACUUM invocation expands into. Snapshot
