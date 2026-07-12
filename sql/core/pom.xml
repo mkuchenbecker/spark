@@ -35,14 +35,6 @@
   </properties>
 
   <dependencies>
-    <!-- Test-only: real Apache Iceberg runtime to exercise VACUUM end-to-end.
-         expire_snapshots / remove_orphan_files behavior matches the LinkedIn custom build. -->
-    <dependency>
-      <groupId>org.apache.iceberg</groupId>
-      <artifactId>iceberg-spark-runtime-3.5_${scala.binary.version}</artifactId>
-      <version>1.5.2</version>
-      <scope>test</scope>
-    </dependency>
     <dependency>
       <groupId>org.rocksdb</groupId>
       <artifactId>rocksdbjni</artifactId>
@@ -291,4 +283,49 @@
       </plugin>
     </plugins>
   </build>
+
+  <profiles>
+    <!--
+      Opt-in profile for the real-Iceberg end-to-end test (VacuumIcebergSuite). It is NOT
+      part of the default build: the Iceberg Spark runtime is a shaded fat jar whose bytecode
+      exceeds this branch's Java 8 target, so carrying it on sql/core's default classpath trips
+      the enforceBytecodeVersion dependency check. Gating both the dependency and the test source
+      directory behind this profile keeps default CI clean while allowing the test to be run on
+      demand with:  build/mvn -Piceberg-integration-tests -pl sql/core test -Dtest=none \
+                              -DwildcardSuites=org.apache.spark.sql.execution.command.VacuumIcebergSuite
+    -->
+    <profile>
+      <id>iceberg-integration-tests</id>
+      <dependencies>
+        <dependency>
+          <groupId>org.apache.iceberg</groupId>
+          <artifactId>iceberg-spark-runtime-3.5_${scala.binary.version}</artifactId>
+          <version>1.5.2</version>
+          <scope>test</scope>
+        </dependency>
+      </dependencies>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>build-helper-maven-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>add-iceberg-integration-test-source</id>
+                <phase>generate-test-sources</phase>
+                <goals>
+                  <goal>add-test-source</goal>
+                </goals>
+                <configuration>
+                  <sources>
+                    <source>src/test/iceberg</source>
+                  </sources>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 </project>
