@@ -196,6 +196,8 @@ statement
     | REFRESH TABLE identifierReference                                #refreshTable
     | VACUUM identifierReference (remove=REMOVE ORPHAN FILES)?
         (RETAIN retainHours=INTEGER_VALUE HOURS)?                      #vacuumTable
+    | OPTIMIZE identifierReference
+        (rewriteManifests=REWRITE MANIFESTS)?                          #optimizeTable
     | REFRESH FUNCTION identifierReference                             #refreshFunction
     | REFRESH (stringLit | .*?)                                        #refreshResource
     | CACHE LAZY? TABLE identifierReference
@@ -1393,6 +1395,7 @@ ansiNonReserved
     | LOGICAL
     | LONG
     | MACRO
+    | MANIFESTS
     | MAP
     | MATCHED
     | MERGE
@@ -1414,6 +1417,7 @@ ansiNonReserved
     | NULLS
     | NUMERIC
     | OF
+    | OPTIMIZE
     | OPTION
     | OPTIONS
     | OUT
@@ -1449,6 +1453,7 @@ ansiNonReserved
     | RESPECT
     | RESTRICT
     | REVOKE
+    | REWRITE
     | RLIKE
     | ROLE
     | ROLES
@@ -1720,6 +1725,7 @@ nonReserved
     | LOGICAL
     | LONG
     | MACRO
+    | MANIFESTS
     | MAP
     | MATCHED
     | MERGE
@@ -1745,6 +1751,7 @@ nonReserved
     | OF
     | OFFSET
     | ONLY
+    | OPTIMIZE
     | OPTION
     | OPTIONS
     | OR
@@ -1788,6 +1795,7 @@ nonReserved
     | RESPECT
     | RESTRICT
     | REVOKE
+    | REWRITE
     | RLIKE
     | ROLE
     | ROLES

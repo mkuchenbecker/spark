@@ -808,4 +808,11 @@ class SparkSqlParserSuite extends AnalysisTest with SharedSparkSession {
     assertEqual("VACUUM a.b REMOVE ORPHAN FILES RETAIN 168 HOURS",
       VacuumTableCommand(Seq("a", "b"), removeOrphanFiles = true, retainHours = Some(168)))
   }
+
+  test("OPTIMIZE table") {
+    assertEqual("OPTIMIZE a.b.c",
+      OptimizeTableCommand(Seq("a", "b", "c"), rewriteManifests = false))
+    assertEqual("OPTIMIZE tbl REWRITE MANIFESTS",
+      OptimizeTableCommand(Seq("tbl"), rewriteManifests = true))
+  }
 }

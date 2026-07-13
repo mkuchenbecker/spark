@@ -81,6 +81,18 @@ class SparkSqlAstBuilder extends AstBuilder {
   }
 
   /**
+   * Create an [[OptimizeTableCommand]] logical plan. For example:
+   * {{{
+   *   OPTIMIZE multi_part_name [REWRITE MANIFESTS]
+   * }}}
+   */
+  override def visitOptimizeTable(ctx: OptimizeTableContext): LogicalPlan = withOrigin(ctx) {
+    val rewriteManifests = ctx.rewriteManifests != null
+    withIdentClause(ctx.identifierReference(), nameParts =>
+      OptimizeTableCommand(nameParts, rewriteManifests))
+  }
+
+  /**
    * Create a [[SetCommand]] logical plan.
    *
    * Note that we assume that everything after the SET keyword is assumed to be a part of the

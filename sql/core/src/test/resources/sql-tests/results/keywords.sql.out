@@ -168,6 +168,7 @@ LOCKS	false
 LOGICAL	false
 LONG	false
 MACRO	false
+MANIFESTS	false
 MAP	false
 MATCHED	false
 MERGE	false
@@ -195,6 +196,7 @@ OF	false
 OFFSET	false
 ON	false
 ONLY	false
+OPTIMIZE	false
 OPTION	false
 OPTIONS	false
 OR	false
@@ -241,6 +243,7 @@ RESPECT	false
 RESTRICT	false
 RETAIN	false
 REVOKE	false
+REWRITE	false
 RIGHT	false
 ROLE	false
 ROLES	false
