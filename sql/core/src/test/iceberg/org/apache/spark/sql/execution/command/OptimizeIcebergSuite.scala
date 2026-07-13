@@ -26,8 +26,13 @@ import org.apache.spark.util.Utils
 
 /**
  * End-to-end behavior test for OPTIMIZE against a real Apache Iceberg table (Hadoop catalog).
- * Verifies the command's actual effects -- data-file compaction and manifest rewrite -- not just
- * the CALLs it emits.
+ *
+ * Assertions follow a delta discipline: every check pins a self-defending baseline first (so a
+ * relative assertion cannot pass vacuously on an empty table), then asserts the DIRECTION of the
+ * metadata change plus the invariant that must always hold -- the current data is unchanged. It
+ * additionally asserts that OPTIMIZE actually committed work (a new snapshot), so a silent no-op
+ * fails loudly rather than masquerading as success. Physical counts are read from Iceberg's
+ * `.files` / `.manifests` / `.snapshots` metadata tables, never from raw directory listings.
  */
 class OptimizeIcebergSuite extends QueryTest with SharedSparkSession {
 
@@ -50,50 +55,63 @@ class OptimizeIcebergSuite extends QueryTest with SharedSparkSession {
     super.beforeAll()
   }
 
-  /** Number of data files the table currently references, per Iceberg's `.files` table. */
-  private def fileCount(table: String): Long =
-    sql(s"SELECT COUNT(*) FROM $table.files").collect().head.getLong(0)
+  private def count(query: String): Long = sql(query).collect().head.getLong(0)
+  private def snapshotCount(table: String): Long = count(s"SELECT count(*) FROM $table.snapshots")
+  private def dataFileCount(table: String): Long = count(s"SELECT count(*) FROM $table.files")
+  private def manifestCount(table: String): Long = count(s"SELECT count(*) FROM $table.manifests")
 
-  /** Number of manifest files for the current snapshot, per Iceberg's `.manifests` table. */
-  private def manifestCount(table: String): Long =
-    sql(s"SELECT COUNT(*) FROM $table.manifests").collect().head.getLong(0)
+  /** Append `n` single-row files; each single-row insert is one data file on an unpartitioned table. */
+  private def seed(table: String, n: Int): Unit =
+    (1 to n).foreach(i => sql(s"INSERT INTO $table VALUES ($i)"))
 
-  // rewrite_data_files bin-packs a group once it has at least `min-input-files` (default 5) small
-  // files, so six single-row inserts reliably produce a compactable group.
-  private val numInserts = 6
+  private def messageChain(t: Throwable): String =
+    Iterator.iterate(t)(_.getCause).takeWhile(_ != null)
+      .flatMap(e => Option(e.getMessage)).mkString(" | ")
 
-  test("OPTIMIZE compacts small data files on a real Iceberg table") {
+  test("OPTIMIZE compacts data files, commits a new snapshot, and preserves data") {
     sql("CREATE TABLE ice.db.o1 (id INT) USING iceberg")
-    (1 to numInserts).foreach(i => sql(s"INSERT INTO ice.db.o1 VALUES ($i)"))
-    assert(fileCount("ice.db.o1") === numInserts,
-      s"$numInserts inserts should produce $numInserts data files")
+    seed("ice.db.o1", 6)
 
-    sql("VACUUM ice.db.o1 RETAIN 0 HOURS") // no-op guard: OPTIMIZE must not depend on expiration
+    // Baseline: six single-row inserts -> six data files. Self-defends the compaction delta below.
+    assert(dataFileCount("ice.db.o1") === 6, "six inserts should produce six data files")
+    val filesBefore = dataFileCount("ice.db.o1")
+    val snapshotsBefore = snapshotCount("ice.db.o1")
+
     sql("OPTIMIZE ice.db.o1")
 
-    assert(fileCount("ice.db.o1") < numInserts,
-      "compaction should reduce the number of referenced data files")
-    checkAnswer(
-      sql("SELECT id FROM ice.db.o1 ORDER BY id"),
-      (1 to numInserts).map(Row(_)))
+    // Compaction happened: strictly fewer data files AND a fresh commit (rewrite_data_files only
+    // commits when it actually rewrote files, so this catches a silent no-op). OPTIMIZE must not
+    // expire snapshots (that is VACUUM's job), so the snapshot count only grows.
+    assert(dataFileCount("ice.db.o1") < filesBefore,
+      s"compaction should reduce data files: $filesBefore -> ${dataFileCount("ice.db.o1")}")
+    assert(snapshotCount("ice.db.o1") > snapshotsBefore,
+      "compaction must commit a new snapshot (proves OPTIMIZE did real work, and did not expire)")
+    checkAnswer(sql("SELECT id FROM ice.db.o1 ORDER BY id"), (1 to 6).map(Row(_)))
   }
 
-  test("OPTIMIZE REWRITE MANIFESTS compacts manifests and keeps the table readable") {
+  test("OPTIMIZE REWRITE MANIFESTS compacts manifests and preserves data") {
     sql("CREATE TABLE ice.db.o2 (id INT) USING iceberg")
-    (1 to numInserts).foreach(i => sql(s"INSERT INTO ice.db.o2 VALUES ($i)"))
+    seed("ice.db.o2", 6)
 
+    // Baseline: multiple manifests exist to merge (each fast-append writes its own manifest; Iceberg
+    // does not auto-merge until far more than six). Self-defends the manifest-reduction delta.
     val manifestsBefore = manifestCount("ice.db.o2")
-    assert(manifestsBefore > 1,
-      s"$numInserts appends should produce more than one manifest, got $manifestsBefore")
+    assert(manifestsBefore >= 2,
+      s"six appends should leave multiple manifests to compact, got $manifestsBefore")
+    val snapshotsBefore = snapshotCount("ice.db.o2")
 
     sql("OPTIMIZE ice.db.o2 REWRITE MANIFESTS")
 
-    // Data-file compaction always runs; manifest compaction ran too.
-    assert(fileCount("ice.db.o2") < numInserts, "data files should be compacted")
     assert(manifestCount("ice.db.o2") < manifestsBefore,
-      "manifest rewrite should reduce the number of manifests")
-    checkAnswer(
-      sql("SELECT id FROM ice.db.o2 ORDER BY id"),
-      (1 to numInserts).map(Row(_)))
+      s"manifest rewrite should reduce manifests: $manifestsBefore -> ${manifestCount("ice.db.o2")}")
+    assert(dataFileCount("ice.db.o2") < 6, "the mandatory data-file compaction leg must also run")
+    assert(snapshotCount("ice.db.o2") > snapshotsBefore, "the rewrites must commit new snapshots")
+    checkAnswer(sql("SELECT id FROM ice.db.o2 ORDER BY id"), (1 to 6).map(Row(_)))
+  }
+
+  test("OPTIMIZE on a missing table fails and names the table") {
+    val e = intercept[Exception](sql("OPTIMIZE ice.db.no_such_optimize_table").collect())
+    assert(messageChain(e).contains("no_such_optimize_table"),
+      s"error must identify the missing table: ${messageChain(e).take(300)}")
   }
 }
