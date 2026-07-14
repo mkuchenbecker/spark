@@ -69,6 +69,13 @@ echo "Running CRAN check with $CRAN_CHECK_OPTIONS options"
 # Jenkins installs arrow. See SPARK-29339.
 export _R_CHECK_FORCE_SUGGESTS_=FALSE
 
+# The "CRAN incoming feasibility" check reaches out to CRAN's servers over the
+# network to compare against the published package DB. That fetch is flaky in CI
+# and intermittently returns a malformed payload (e.g. read.dcf "Line starting
+# '...' is malformed!"), which fails the whole job even though every SparkR test
+# passes. Disable only the remote portion; the local --as-cran checks still run.
+export _R_CHECK_CRAN_INCOMING_REMOTE_=FALSE
+
 if [ -n "$NO_TESTS" ] && [ -n "$NO_MANUAL" ]
 then
   "$R_SCRIPT_PATH/R" CMD check $CRAN_CHECK_OPTIONS "SparkR_$VERSION.tar.gz"
