@@ -20,6 +20,7 @@ package org.apache.spark.sql.execution.command
 import scala.util.control.NonFatal
 
 import org.apache.spark.sql.{Row, SparkSession}
+import org.apache.spark.sql.catalyst.expressions.Literal
 import org.apache.spark.sql.catalyst.util.quoteIfNeeded
 import org.apache.spark.sql.functions.{col, lit}
 
@@ -127,8 +128,24 @@ case class OptimizeTableCommand(
     val hwmMax =
       if (full) None else hwm.flatMap(h => leadKeyMaxOrNone(spark, qualified, leadKey, h))
 
+    // True no-op: an incremental run whose leading key has not advanced past the previous watermark
+    // has nothing to recluster; leave the watermark in place rather than churning an empty rewrite.
+    if (hwmMax.exists(lo => !valueGt(floorMax.get, lo))) return
+
     val predicate = scopePredicate(leadKey, hwmMax, floorMax.get)
+    // The scope is non-empty (data exists at/below floorMax) and `rewrite-all` forces a rewrite, so
+    // a healthy run always commits a new snapshot. If nothing committed, the rewrite failed
+    // systemically -- partial progress swallows per-group failures, which would otherwise leave a
+    // silent no-op. Fail loudly and leave the watermark unadvanced so the run is retryable.
+    val snapshotsBefore = snapshotCount(spark, qualified)
     spark.sql(clusterCall(cat, tableArg, sortMode, keys, predicate, maxCommits)).collect()
+    if (snapshotCount(spark, qualified) <= snapshotsBefore) {
+      throw new IllegalStateException(
+        s"OPTIMIZE clustered no data for '$qualified': the rewrite committed no snapshot despite " +
+          "a non-empty scope. This usually means an unsupported clustering configuration -- for " +
+          "example, z-order (sort-mode=zorder) on a column type Iceberg cannot z-order, such as " +
+          s"decimal. Keys=[${keys.mkString(",")}], sort-mode=$sortMode.")
+    }
     // Advance the watermark to the consumed age floor (not head), so held-back snapshots remain
     // unconsumed and are picked up once they age past the floor.
     spark.sql(setHwmCall(cat, tableArg, floorId)).collect()
@@ -161,14 +178,13 @@ object OptimizeTableCommand {
     if (sortMode.equalsIgnoreCase("zorder")) s"zorder($cols)" else cols
   }
 
-  /** Double single quotes so a value can be embedded in a single-quoted SQL string. */
-  def escapeSqlString(s: String): String = s.replace("'", "''")
-
   /**
    * The clustering `CALL`: a scoped sort / z-order `rewrite_data_files` with partial progress.
    * `min-input-files=1` + `rewrite-all=true` cluster the scoped region regardless of file count
    * (optimization, not compaction); `use-starting-sequence-number=true` keeps concurrent
-   * equality-deletes valid; partial progress bounds snapshots per run. Exposed for testing.
+   * equality-deletes valid; partial progress bounds snapshots per run. The `where` predicate is
+   * rendered as a SQL string literal via Catalyst so its own quotes (string / timestamp / date
+   * literals) survive the CALL's string-literal parsing. Exposed for testing.
    */
   def clusterCall(
       catalog: String,
@@ -181,8 +197,8 @@ object OptimizeTableCommand {
     s"CALL $catalog.system.rewrite_data_files(" +
       s"table => '$table', " +
       "strategy => 'sort', " +
-      s"sort_order => '${escapeSqlString(order)}', " +
-      s"where => '${escapeSqlString(whereClause)}', " +
+      s"sort_order => '$order', " +
+      s"where => ${Literal(whereClause).sql}, " +
       "options => map(" +
       "'min-input-files', '1', " +
       "'rewrite-all', 'true', " +
@@ -209,6 +225,13 @@ object OptimizeTableCommand {
     }
     cond.expr.sql
   }
+
+  /** True if `a > b` for two values of the same (Comparable) leading-key type. */
+  private def valueGt(a: Any, b: Any): Boolean =
+    a.asInstanceOf[Comparable[Any]].compareTo(b) > 0
+
+  private def snapshotCount(spark: SparkSession, qualified: String): Long =
+    spark.sql(s"SELECT count(*) FROM $qualified.snapshots").collect().head.getLong(0)
 
   private def tableProperties(spark: SparkSession, qualified: String): Map[String, String] =
     spark.sql(s"SHOW TBLPROPERTIES $qualified").collect()

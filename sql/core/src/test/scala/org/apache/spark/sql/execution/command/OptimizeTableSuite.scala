@@ -63,10 +63,11 @@ class OptimizeTableSuite extends SparkFunSuite {
         "'partial-progress.max-commits', '10'))")
   }
 
-  test("clusterCall: single quotes in the where clause are escaped for embedding") {
+  test("clusterCall: quotes in the where clause survive as a Catalyst string literal") {
     val stmt = clusterCall("cat", "db.t", "sort", Seq("ts"),
       "`ts` <= TIMESTAMP '2026-01-01 00:00:00'", maxCommits = 5)
-    assert(stmt.contains("where => '`ts` <= TIMESTAMP ''2026-01-01 00:00:00''', "))
+    // Rendered via Literal(...).sql, so inner quotes are backslash-escaped the way Spark re-parses.
+    assert(stmt.contains("where => '`ts` <= TIMESTAMP \\'2026-01-01 00:00:00\\'', "), stmt)
     assert(stmt.contains("sort_order => 'ts', "))
     assert(stmt.contains("'partial-progress.max-commits', '5'"))
   }
