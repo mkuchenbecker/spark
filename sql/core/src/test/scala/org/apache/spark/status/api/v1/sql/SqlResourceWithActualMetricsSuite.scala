@@ -23,6 +23,7 @@ import javax.servlet.http.HttpServletResponse
 
 import org.json4s.DefaultFormats
 import org.json4s.jackson.JsonMethods
+import org.scalatest.time.SpanSugar._
 
 import org.apache.spark.SparkConf
 import org.apache.spark.deploy.history.HistoryServerSuite.getContentAndCode
@@ -139,13 +140,19 @@ class SqlResourceWithActualMetricsSuite
 
       val url = new URL(spark.sparkContext.ui.get.webUrl +
         s"/api/v1/applications/${spark.sparkContext.applicationId}/sql")
-      val result = verifyAndGetSqlRestResult(url)
-      val executionDataList = JsonMethods.parse(result)
-        .extract[Seq[ExecutionData]]
-        .filter(_.planDescription.contains("SPARK_44334"))
-      assert(executionDataList.size == 2)
-      assert(executionDataList.head.status == "COMPLETED")
-      assert(executionDataList.last.status == "FAILED")
+      // The execution status is updated asynchronously by the SQL status listener, so the failed
+      // execution can still read as RUNNING immediately after the statement returns. Poll the REST
+      // endpoint until the store reflects the terminal status rather than reading it once
+      // (SPARK-44334 flakiness: "RUNNING" did not equal "FAILED").
+      eventually(timeout(30.seconds), interval(100.milliseconds)) {
+        val result = verifyAndGetSqlRestResult(url)
+        val executionDataList = JsonMethods.parse(result)
+          .extract[Seq[ExecutionData]]
+          .filter(_.planDescription.contains("SPARK_44334"))
+        assert(executionDataList.size == 2)
+        assert(executionDataList.head.status == "COMPLETED")
+        assert(executionDataList.last.status == "FAILED")
+      }
     }
   }
 
