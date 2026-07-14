@@ -811,8 +811,12 @@ class SparkSqlParserSuite extends AnalysisTest with SharedSparkSession {
 
   test("OPTIMIZE table") {
     assertEqual("OPTIMIZE a.b.c",
-      OptimizeTableCommand(Seq("a", "b", "c"), rewriteManifests = false))
+      OptimizeTableCommand(Seq("a", "b", "c"), full = false, rewriteManifests = false))
+    assertEqual("OPTIMIZE tbl FULL",
+      OptimizeTableCommand(Seq("tbl"), full = true, rewriteManifests = false))
     assertEqual("OPTIMIZE tbl REWRITE MANIFESTS",
-      OptimizeTableCommand(Seq("tbl"), rewriteManifests = true))
+      OptimizeTableCommand(Seq("tbl"), full = false, rewriteManifests = true))
+    assertEqual("OPTIMIZE tbl FULL REWRITE MANIFESTS",
+      OptimizeTableCommand(Seq("tbl"), full = true, rewriteManifests = true))
   }
 }

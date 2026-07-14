@@ -197,6 +197,7 @@ statement
     | VACUUM identifierReference (remove=REMOVE ORPHAN FILES)?
         (RETAIN retainHours=INTEGER_VALUE HOURS)?                      #vacuumTable
     | OPTIMIZE identifierReference
+        (full=FULL)?
         (rewriteManifests=REWRITE MANIFESTS)?                          #optimizeTable
     | REFRESH FUNCTION identifierReference                             #refreshFunction
     | REFRESH (stringLit | .*?)                                        #refreshResource
