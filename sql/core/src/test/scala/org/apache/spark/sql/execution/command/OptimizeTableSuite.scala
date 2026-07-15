@@ -72,9 +72,58 @@ class OptimizeTableSuite extends SparkFunSuite {
     assert(stmt.contains("'partial-progress.max-commits', '5'"))
   }
 
-  test("setHwmCall: advances the watermark table property") {
-    assert(setHwmCall("cat", "db.t", 42L) ===
-      "ALTER TABLE cat.db.t SET TBLPROPERTIES ('optimize.cluster.hwm-snapshot-id' = '42')")
+  test("setClusterMetaCall: advances watermark, config id, and state in one statement") {
+    val stmt = setClusterMetaCall("cat", "db.t", 42L, "abc123", """[{"config":"abc123"}]""")
+    assert(stmt.startsWith("ALTER TABLE cat.db.t SET TBLPROPERTIES ("))
+    assert(stmt.contains("'optimize.cluster.hwm-snapshot-id' = '42'"))
+    assert(stmt.contains("'optimize.cluster.config-id' = 'abc123'"))
+    // State JSON embedded as a Catalyst literal; JSON double-quotes are literal inside the
+    // single-quoted SQL string (only single-quotes/backslashes would need escaping).
+    assert(stmt.contains("""'optimize.cluster.state' = '[{"config":"abc123"}]'"""), stmt)
+  }
+
+  test("configId: stable across whitespace, changes on key or mode change") {
+    assert(configId(Seq("ts", "uid"), "zorder") === configId(Seq(" ts ", " uid "), "ZORDER"))
+    assert(configId(Seq("ts", "uid"), "zorder") !== configId(Seq("ts"), "zorder"))
+    assert(configId(Seq("ts"), "zorder") !== configId(Seq("ts"), "sort"))
+  }
+
+  test("state: render/parse round-trips, including the optional lower bound") {
+    val intervals = Seq(
+      ClusterInterval("c1", "ts", "sort", Some("10"), "20"),
+      ClusterInterval("c2", "ts,uid", "zorder", None, "2026-01-06 00:00:00"))
+    assert(parseState(renderState(intervals)) === intervals)
+  }
+
+  test("state: malformed or empty input parses as no state") {
+    assert(parseState("") === Seq.empty)
+    assert(parseState(null) === Seq.empty)
+    assert(parseState("not json") === Seq.empty)
+  }
+
+  test("advanceState: first run creates an interval") {
+    assert(advanceState(Seq.empty, "c1", Seq("ts"), "sort", Some("5"), "10", full = false) ===
+      Seq(ClusterInterval("c1", "ts", "sort", Some("5"), "10")))
+  }
+
+  test("advanceState: same-config incremental extends the upper, keeps the lower") {
+    val s0 = Seq(ClusterInterval("c1", "ts", "sort", Some("5"), "10"))
+    assert(advanceState(s0, "c1", Seq("ts"), "sort", Some("10"), "20", full = false) ===
+      Seq(ClusterInterval("c1", "ts", "sort", Some("5"), "20")))
+  }
+
+  test("advanceState: FULL collapses the current config to one unbounded interval") {
+    val s0 = Seq(ClusterInterval("c1", "ts", "sort", Some("5"), "20"))
+    assert(advanceState(s0, "c1", Seq("ts"), "sort", None, "30", full = true) ===
+      Seq(ClusterInterval("c1", "ts", "sort", None, "30")))
+  }
+
+  test("advanceState: a config change appends a new epoch and retains the old one") {
+    val s0 = Seq(ClusterInterval("c1", "ts", "sort", None, "20"))
+    val s1 = advanceState(s0, "c2", Seq("ts", "uid"), "zorder", Some("20"), "40", full = false)
+    assert(s1 === Seq(
+      ClusterInterval("c1", "ts", "sort", None, "20"),
+      ClusterInterval("c2", "ts,uid", "zorder", Some("20"), "40")))
   }
 
   test("scopePredicate: incremental run bounds the leading key on both sides") {

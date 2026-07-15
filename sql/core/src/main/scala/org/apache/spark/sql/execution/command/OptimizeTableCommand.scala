@@ -17,12 +17,20 @@
 
 package org.apache.spark.sql.execution.command
 
+import java.nio.charset.StandardCharsets
+import java.util.Locale
+import java.util.zip.CRC32
+
+import scala.collection.mutable
 import scala.util.control.NonFatal
 
+import com.fasterxml.jackson.databind.ObjectMapper
+
 import org.apache.spark.sql.{Row, SparkSession}
-import org.apache.spark.sql.catalyst.expressions.Literal
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Literal}
 import org.apache.spark.sql.catalyst.util.quoteIfNeeded
 import org.apache.spark.sql.functions.{col, lit}
+import org.apache.spark.sql.types.StringType
 
 /**
  * The logical plan of the OPTIMIZE command, which runs Iceberg table maintenance by delegating to
@@ -63,6 +71,10 @@ case class OptimizeTableCommand(
 
   import OptimizeTableCommand._
 
+  override lazy val output: Seq[Attribute] = Seq(
+    AttributeReference("metric", StringType, nullable = false)(),
+    AttributeReference("value", StringType, nullable = false)())
+
   override def run(sparkSession: SparkSession): Seq[Row] = {
     val catalogManager = sparkSession.sessionState.catalogManager
     val (catalog, table) = nameParts match {
@@ -74,6 +86,11 @@ case class OptimizeTableCommand(
     val cat = quoteIfNeeded(catalog)
     val tableArg = table.map(quoteIfNeeded).mkString(".")
     val qualified = s"$cat.$tableArg"
+
+    // Snapshot the physical layout before doing any work so we can report the reduction. This is
+    // also the first table access, so a missing table fails here naming the table.
+    val filesBefore = dataFileCount(sparkSession, qualified)
+    val snapshotsBefore = snapshotCount(sparkSession, qualified)
 
     val props = tableProperties(sparkSession, qualified)
     val keys = props.get(KEYS_PROP)
@@ -90,7 +107,14 @@ case class OptimizeTableCommand(
     if (rewriteManifests) {
       sparkSession.sql(rewriteManifestsCall(cat, tableArg)).collect()
     }
-    Seq.empty[Row]
+
+    val filesAfter = dataFileCount(sparkSession, qualified)
+    val snapshotsAfter = snapshotCount(sparkSession, qualified)
+    Seq(
+      Row("files_before", filesBefore.toString),
+      Row("files_after", filesAfter.toString),
+      Row("files_removed", (filesBefore - filesAfter).toString),
+      Row("snapshots_committed", (snapshotsAfter - snapshotsBefore).toString))
   }
 
   private def cluster(
@@ -146,9 +170,15 @@ case class OptimizeTableCommand(
           "example, z-order (sort-mode=zorder) on a column type Iceberg cannot z-order, such as " +
           s"decimal. Keys=[${keys.mkString(",")}], sort-mode=$sortMode.")
     }
-    // Advance the watermark to the consumed age floor (not head), so held-back snapshots remain
-    // unconsumed and are picked up once they age past the floor.
-    spark.sql(setHwmCall(cat, tableArg, floorId)).collect()
+    // Advance the clustering metadata in a single commit: the watermark (consumed age floor, not
+    // head), the current config id, and the interval state that records which leading-key range is
+    // now clustered under which key selection. These are one logical fact, so they must land
+    // together; a missing (expired) watermark rewrote from -inf, so the epoch has no lower bound.
+    val cfgId = configId(keys, sortMode)
+    val newState = advanceState(
+      parseState(props.getOrElse(STATE_PROP, "")),
+      cfgId, keys, sortMode, hwmMax.map(renderValue), renderValue(floorMax.get), full)
+    spark.sql(setClusterMetaCall(cat, tableArg, floorId, cfgId, renderState(newState))).collect()
   }
 }
 
@@ -159,10 +189,96 @@ object OptimizeTableCommand {
   val MIN_SNAPSHOT_AGE_PROP = "optimize.cluster.min-snapshot-age-minutes"
   val HWM_PROP = "optimize.cluster.hwm-snapshot-id"
   val MAX_COMMITS_PROP = "optimize.cluster.max-commits"
+  val CONFIG_ID_PROP = "optimize.cluster.config-id"
+  val STATE_PROP = "optimize.cluster.state"
 
   val DEFAULT_SORT_MODE = "zorder"
   val DEFAULT_MIN_SNAPSHOT_AGE_MINUTES = 30L
   val DEFAULT_MAX_COMMITS = 10L
+
+  private val stateMapper = new ObjectMapper()
+
+  /**
+   * One clustered leading-key interval `(lower, upper]` under a specific key selection (`config`).
+   * `lower = None` means unbounded below (a FULL / first backfill). Persisted, alongside the
+   * watermark, in the `optimize.cluster.state` table property so it survives snapshot expiration.
+   */
+  case class ClusterInterval(
+      config: String, keys: String, mode: String, lower: Option[String], upper: String)
+
+  /** Stable, compact identity of a key selection: only a keys/mode change produces a new id. */
+  def configId(keys: Seq[String], sortMode: String): String = {
+    val normalized = keys.map(_.trim).mkString(",") + "|" + sortMode.toLowerCase(Locale.ROOT)
+    val crc = new CRC32()
+    crc.update(normalized.getBytes(StandardCharsets.UTF_8))
+    java.lang.Long.toHexString(crc.getValue)
+  }
+
+  /** Render a leading-key value for storage; consumers CAST it back to the key type in SQL. */
+  def renderValue(v: Any): String = v.toString
+
+  /** Serialize interval state to the JSON stored in `optimize.cluster.state`. For testing. */
+  def renderState(intervals: Seq[ClusterInterval]): String = {
+    val arr = new java.util.ArrayList[java.util.Map[String, Object]]()
+    intervals.foreach { iv =>
+      val m = new java.util.LinkedHashMap[String, Object]()
+      m.put("config", iv.config)
+      m.put("keys", iv.keys)
+      m.put("mode", iv.mode)
+      iv.lower.foreach(l => m.put("lower", l))
+      m.put("upper", iv.upper)
+      arr.add(m)
+    }
+    stateMapper.writeValueAsString(arr)
+  }
+
+  /** Parse interval state; malformed or empty input is treated as no state. Exposed for testing. */
+  def parseState(json: String): Seq[ClusterInterval] = {
+    if (json == null || json.trim.isEmpty) return Seq.empty
+    try {
+      val arr = stateMapper.readValue(json, classOf[java.util.List[java.util.Map[String, String]]])
+      val out = mutable.ArrayBuffer[ClusterInterval]()
+      val it = arr.iterator()
+      while (it.hasNext) {
+        val m = it.next().asInstanceOf[java.util.Map[String, String]]
+        out += ClusterInterval(
+          Option(m.get("config")).getOrElse(""),
+          Option(m.get("keys")).getOrElse(""),
+          Option(m.get("mode")).getOrElse(""),
+          Option(m.get("lower")),
+          Option(m.get("upper")).getOrElse(""))
+      }
+      out.toSeq
+    } catch {
+      case NonFatal(_) => Seq.empty
+    }
+  }
+
+  /**
+   * Fold a completed run into the interval state. A same-config incremental run extends the current
+   * epoch's upper bound (keeping its lower); a config change appends a new epoch, retains the old
+   * ones (durable key-selection history); FULL collapses the current config to one unbounded-below
+   * interval. Exposed for testing.
+   */
+  def advanceState(
+      existing: Seq[ClusterInterval],
+      cfgId: String,
+      keys: Seq[String],
+      mode: String,
+      lower: Option[String],
+      upper: String,
+      full: Boolean): Seq[ClusterInterval] = {
+    val keysStr = keys.mkString(",")
+    val others = existing.filterNot(_.config == cfgId)
+    if (full) {
+      others :+ ClusterInterval(cfgId, keysStr, mode, None, upper)
+    } else {
+      existing.find(_.config == cfgId) match {
+        case Some(cur) => others :+ cur.copy(keys = keysStr, mode = mode, upper = upper)
+        case None => existing :+ ClusterInterval(cfgId, keysStr, mode, lower, upper)
+      }
+    }
+  }
 
   /** The `CALL` for plain bin-pack compaction (no clustering configured). Exposed for testing. */
   def compactionCall(catalog: String, table: String): String =
@@ -207,9 +323,21 @@ object OptimizeTableCommand {
       s"'partial-progress.max-commits', '$maxCommits'))"
   }
 
-  /** The `ALTER TABLE` that advances the clustering watermark. Exposed for testing. */
-  def setHwmCall(catalog: String, table: String, snapshotId: Long): String =
-    s"ALTER TABLE $catalog.$table SET TBLPROPERTIES ('$HWM_PROP' = '$snapshotId')"
+  /**
+   * The single `ALTER TABLE` that advances all clustering metadata at once -- watermark, config id,
+   * and interval state -- so they never disagree across a crash. The state JSON is embedded as a
+   * Catalyst string literal so its quotes/braces survive parsing. Exposed for testing.
+   */
+  def setClusterMetaCall(
+      catalog: String,
+      table: String,
+      snapshotId: Long,
+      cfgId: String,
+      stateJson: String): String =
+    s"ALTER TABLE $catalog.$table SET TBLPROPERTIES (" +
+      s"'$HWM_PROP' = '$snapshotId', " +
+      s"'$CONFIG_ID_PROP' = '$cfgId', " +
+      s"'$STATE_PROP' = ${Literal(stateJson).sql})"
 
   /**
    * The `where` predicate bounding the leading-key slice to recluster: `lead <= upper`, plus
@@ -232,6 +360,9 @@ object OptimizeTableCommand {
 
   private def snapshotCount(spark: SparkSession, qualified: String): Long =
     spark.sql(s"SELECT count(*) FROM $qualified.snapshots").collect().head.getLong(0)
+
+  private def dataFileCount(spark: SparkSession, qualified: String): Long =
+    spark.sql(s"SELECT count(*) FROM $qualified.files").collect().head.getLong(0)
 
   private def tableProperties(spark: SparkSession, qualified: String): Map[String, String] =
     spark.sql(s"SHOW TBLPROPERTIES $qualified").collect()

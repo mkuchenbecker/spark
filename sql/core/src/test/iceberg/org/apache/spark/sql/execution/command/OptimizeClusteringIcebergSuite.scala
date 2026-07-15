@@ -58,9 +58,14 @@ class OptimizeClusteringIcebergSuite extends QueryTest with SharedSparkSession {
   private def rowCount(t: String): Long = count(s"SELECT count(*) FROM $t")
   private def dataFiles(t: String): Set[String] =
     sql(s"SELECT file_path FROM $t.files").collect().map(_.getString(0)).toSet
-  private def hwm(t: String): Option[String] =
-    sql(s"SHOW TBLPROPERTIES $t").collect()
-      .find(_.getString(0) == "optimize.cluster.hwm-snapshot-id").map(_.getString(1))
+  private def prop(t: String, key: String): Option[String] =
+    sql(s"SHOW TBLPROPERTIES $t").collect().find(_.getString(0) == key).map(_.getString(1))
+  private def hwm(t: String): Option[String] = prop(t, "optimize.cluster.hwm-snapshot-id")
+  private def state(t: String): Seq[OptimizeTableCommand.ClusterInterval] =
+    OptimizeTableCommand.parseState(prop(t, "optimize.cluster.state").getOrElse(""))
+  private def optimizeMetrics(t: String, full: Boolean = false): Map[String, String] =
+    sql(s"OPTIMIZE $t${if (full) " FULL" else ""}").collect()
+      .map(r => r.getString(0) -> r.getString(1)).toMap
   private def rows(t: String, orderBy: String): Seq[Row] =
     sql(s"SELECT * FROM $t ORDER BY $orderBy").collect().toSeq
   private def messageChain(t: Throwable): String =
@@ -357,5 +362,75 @@ class OptimizeClusteringIcebergSuite extends QueryTest with SharedSparkSession {
     assertPreserves(t, "val", full = true)
     assert(rowCount(t) === 6, "null-keyed rows must not be lost")
     checkAnswer(sql(s"SELECT count(*) FROM $t WHERE ts IS NULL"), Row(2))
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Durable interval state (watermark + config id + intervals) and the run's file-reduction output.
+  // ---------------------------------------------------------------------------------------------
+
+  test("state: a clustering run records config id + one interval alongside the watermark") {
+    val t = "ice.db.stt_first"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
+    (1 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    // All three metadata facts land together.
+    assert(hwm(t).isDefined, "watermark set")
+    assert(prop(t, "optimize.cluster.config-id").isDefined, "config id set")
+    val s = state(t)
+    assert(s.size === 1, s"one interval, got $s")
+    assert(s.head.keys === "ts" && s.head.mode === "zorder")
+    assert(s.head.lower.isEmpty && s.head.upper === "6", s"FULL interval unbounded below: $s")
+  }
+
+  test("state: incremental extends the current epoch; FULL collapses it") {
+    val t = "ice.db.stt_ext"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
+    (1 to 3).foreach(i => sql(s"INSERT INTO $t VALUES ($i, $i)"))
+    sql(s"OPTIMIZE $t").collect()
+    assert(state(t).map(_.upper) === Seq("3"))
+    (4 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, $i)"))
+    sql(s"OPTIMIZE $t").collect()
+    val s = state(t)
+    assert(s.size === 1 && s.head.upper === "6", s"single extended interval, got $s")
+    sql(s"OPTIMIZE $t FULL").collect()
+    assert(state(t).size === 1, "FULL keeps a single interval for the config")
+  }
+
+  test("state: a key change appends a new epoch and retains the old one (durable history)") {
+    val t = "ice.db.stt_keychg"
+    sql(s"CREATE TABLE $t (k1 INT, k2 INT, val INT) USING iceberg " +
+      s"TBLPROPERTIES (${clustered("k1")})")
+    (1 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${7 - i}, ${i * 10})"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    val cfg1 = prop(t, "optimize.cluster.config-id")
+    sql(s"ALTER TABLE $t SET TBLPROPERTIES ('optimize.cluster.keys' = 'k2')")
+    (7 to 9).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${20 - i}, ${i * 10})"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    val cfg2 = prop(t, "optimize.cluster.config-id")
+    assert(cfg1 !== cfg2, "config id changes with the key selection")
+    val configs = state(t).map(_.config).toSet
+    assert(configs.size === 2, s"both epochs retained as durable history: ${state(t)}")
+    assert(state(t).exists(_.keys === "k1") && state(t).exists(_.keys === "k2"))
+  }
+
+  test("state: a failed clustering run leaves the state untouched") {
+    val t = "ice.db.stt_fail"
+    sql(s"CREATE TABLE $t (k DECIMAL(10,2), val INT) USING iceberg " +
+      s"TBLPROPERTIES (${clustered("k", sortMode = "zorder")})")
+    (1 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i.50, $i)"))
+    intercept[Exception](sql(s"OPTIMIZE $t FULL").collect())
+    assert(state(t).isEmpty, "no state written on a failed run")
+    assert(prop(t, "optimize.cluster.config-id").isEmpty, "no config id written on a failed run")
+  }
+
+  test("OPTIMIZE reports the file reduction in its output rows") {
+    val t = "ice.db.stt_metrics"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
+    (1 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    val m = optimizeMetrics(t, full = true)
+    assert(m("files_before") === "6", s"metrics: $m")
+    assert(m("files_after").toInt < 6, s"metrics: $m")
+    assert(m("files_removed").toInt === 6 - m("files_after").toInt, s"metrics: $m")
+    assert(m("snapshots_committed").toInt >= 1, s"metrics: $m")
   }
 }
