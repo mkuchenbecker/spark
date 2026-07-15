@@ -433,4 +433,122 @@ class OptimizeClusteringIcebergSuite extends QueryTest with SharedSparkSession {
     assert(m("files_removed").toInt === 6 - m("files_after").toInt, s"metrics: $m")
     assert(m("snapshots_committed").toInt >= 1, s"metrics: $m")
   }
+
+  // ---------------------------------------------------------------------------------------------
+  // ANALYZE TABLE ... COMPUTE CLUSTERING QUALITY (read-only quality metrics).
+  // ---------------------------------------------------------------------------------------------
+
+  private def analyzeRows(t: String): Seq[Row] =
+    sql(s"ANALYZE TABLE $t COMPUTE CLUSTERING QUALITY").collect().toSeq
+  private def scalar(rows: Seq[Row]): Map[String, String] =
+    rows.filter(_.isNullAt(1)).map(r => r.getString(0) -> r.getString(2)).toMap
+  private def dim(rows: Seq[Row], metric: String, d: String): Option[String] =
+    rows.find(r => r.getString(0) == metric && !r.isNullAt(1) && r.getString(1) == d)
+      .map(_.getString(2))
+
+  test("analyze: unconfigured table reports clustering_configured=false, no error") {
+    val t = "ice.db.aq_none"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg")
+    sql(s"INSERT INTO $t VALUES (1, 10)")
+    val m = scalar(analyzeRows(t))
+    assert(m("clustering_configured") === "false", m.toString)
+  }
+
+  test("analyze: configured but unclustered reports 0 coverage") {
+    val t = "ice.db.aq_unclustered"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
+    (1 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    val m = scalar(analyzeRows(t))
+    assert(m("clustering_configured") === "true")
+    assert(m("coverage_bytes_pct").toDouble === 0.0, m.toString)
+    assert(m("unclustered_tail_hours") === "unknown", "no watermark yet -> unknown tail")
+  }
+
+  test("analyze: after FULL, coverage is ~100% and covered depth is ~1") {
+    val t = "ice.db.aq_full"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
+    (1 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    val rows = analyzeRows(t)
+    val m = scalar(rows)
+    assert(m("coverage_bytes_pct").toDouble > 99.0, m.toString)
+    assert(m("coverage_files_pct").toDouble > 99.0, m.toString)
+    assert(dim(rows, "depth_avg_covered", "ts").exists(_.toDouble <= 1.5), rows.toString)
+  }
+
+  test("analyze: held-back new data lowers coverage below 100%") {
+    val t = "ice.db.aq_partial"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
+    (1 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    // New rows above the clustered range, not yet reclustered -> uncovered.
+    (7 to 12).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    val c = scalar(analyzeRows(t))("coverage_bytes_pct").toDouble
+    assert(c > 0.0 && c < 100.0, s"expected partial coverage, got $c")
+  }
+
+  test("analyze: a key change drops coverage until re-clustered") {
+    val t = "ice.db.aq_keychg"
+    sql(s"CREATE TABLE $t (k1 INT, k2 INT, val INT) USING iceberg " +
+      s"TBLPROPERTIES (${clustered("k1")})")
+    (1 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${7 - i}, ${i * 10})"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    sql(s"ALTER TABLE $t SET TBLPROPERTIES ('optimize.cluster.keys' = 'k2')")
+    // No run under the new key selection yet -> current-config coverage is 0.
+    assert(scalar(analyzeRows(t))("coverage_bytes_pct").toDouble === 0.0)
+    sql(s"OPTIMIZE $t FULL").collect()
+    assert(scalar(analyzeRows(t))("coverage_bytes_pct").toDouble > 99.0, "FULL restores coverage")
+  }
+
+  test("analyze: depth drops after clustering interleaved data") {
+    val t = "ice.db.aq_depth"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
+    // Three files, each spanning the whole key range -> fully interleaved (global depth ~3).
+    (1 to 3).foreach(_ => sql(s"INSERT INTO $t VALUES (1, 1), (6, 6)"))
+    val before = dim(analyzeRows(t), "depth_avg", "ts").map(_.toDouble).getOrElse(0.0)
+    assert(before >= 2.0, s"interleaved data should have high depth, got $before")
+    sql(s"OPTIMIZE $t FULL").collect()
+    val after = dim(analyzeRows(t), "depth_avg_covered", "ts").map(_.toDouble).getOrElse(99.0)
+    assert(after < before, s"clustering should reduce depth: $before -> $after")
+  }
+
+  test("analyze: null leading-key bytes are reported and counted uncovered") {
+    val t = "ice.db.aq_null"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
+    (1 to 4).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"INSERT INTO $t VALUES (CAST(NULL AS INT), 999)")
+    sql(s"OPTIMIZE $t FULL").collect()
+    val m = scalar(analyzeRows(t))
+    assert(m("null_bound_bytes_pct").toDouble > 0.0, s"null-bound file must be reported: $m")
+  }
+
+  test("analyze: timestamp leading key computes coverage") {
+    val t = "ice.db.aq_ts"
+    sql(s"CREATE TABLE $t (ts TIMESTAMP, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
+    (1 to 6).foreach(i => sql(s"INSERT INTO $t VALUES (TIMESTAMP '2026-01-0$i 00:00:00', $i)"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    assert(scalar(analyzeRows(t))("coverage_bytes_pct").toDouble > 99.0)
+  }
+
+  test("analyze: is read-only (no new snapshot, properties unchanged)") {
+    val t = "ice.db.aq_readonly"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
+    (1 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    val snapsBefore = snapshotCount(t)
+    val propsBefore = sql(s"SHOW TBLPROPERTIES $t").collect()
+      .map(r => r.getString(0) -> r.getString(1)).toSet
+    analyzeRows(t)
+    assert(snapshotCount(t) === snapsBefore, "ANALYZE must not commit")
+    val propsAfter = sql(s"SHOW TBLPROPERTIES $t").collect()
+      .map(r => r.getString(0) -> r.getString(1)).toSet
+    assert(propsAfter === propsBefore, "ANALYZE must not change table properties")
+  }
+
+  test("analyze: on a missing table fails and names the table") {
+    val e = intercept[Exception](
+      sql("ANALYZE TABLE ice.db.no_such_analyze_table COMPUTE CLUSTERING QUALITY").collect())
+    assert(messageChain(e).contains("no_such_analyze_table"),
+      s"error must name the missing table: ${messageChain(e).take(300)}")
+  }
 }

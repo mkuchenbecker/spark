@@ -42,6 +42,7 @@ CHECK	false
 CLEAR	false
 CLUSTER	false
 CLUSTERED	false
+CLUSTERING	false
 CODEGEN	false
 COLLATE	false
 COLLECTION	false
@@ -223,6 +224,7 @@ PRIMARY	false
 PRINCIPALS	false
 PROPERTIES	false
 PURGE	false
+QUALITY	false
 QUARTER	false
 QUERY	false
 RANGE	false

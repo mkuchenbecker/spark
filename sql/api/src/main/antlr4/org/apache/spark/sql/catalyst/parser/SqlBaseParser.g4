@@ -103,6 +103,8 @@ statement
         (AS? query)?                                                   #replaceTable
     | ANALYZE TABLE identifierReference partitionSpec? COMPUTE STATISTICS
         (identifier | FOR COLUMNS identifierSeq | FOR ALL COLUMNS)?    #analyze
+    | ANALYZE TABLE identifierReference
+        COMPUTE CLUSTERING QUALITY                                    #analyzeClusteringQuality
     | ANALYZE TABLES ((FROM | IN) identifierReference)? COMPUTE STATISTICS
         (identifier)?                                                  #analyzeTables
     | ALTER TABLE identifierReference
@@ -1304,6 +1306,7 @@ ansiNonReserved
     | CLEAR
     | CLUSTER
     | CLUSTERED
+    | CLUSTERING
     | CODEGEN
     | COLLECTION
     | COLUMNS
@@ -1437,6 +1440,7 @@ ansiNonReserved
     | PRINCIPALS
     | PROPERTIES
     | PURGE
+    | QUALITY
     | QUARTER
     | QUERY
     | RANGE
@@ -1608,6 +1612,7 @@ nonReserved
     | CLEAR
     | CLUSTER
     | CLUSTERED
+    | CLUSTERING
     | CODEGEN
     | COLLATE
     | COLLECTION
@@ -1778,6 +1783,7 @@ nonReserved
     | PRINCIPALS
     | PROPERTIES
     | PURGE
+    | QUALITY
     | QUARTER
     | QUERY
     | RANGE

@@ -94,6 +94,18 @@ class SparkSqlAstBuilder extends AstBuilder {
   }
 
   /**
+   * Create an [[AnalyzeClusteringQualityCommand]] logical plan. For example:
+   * {{{
+   *   ANALYZE TABLE multi_part_name COMPUTE CLUSTERING QUALITY
+   * }}}
+   */
+  override def visitAnalyzeClusteringQuality(
+      ctx: AnalyzeClusteringQualityContext): LogicalPlan = withOrigin(ctx) {
+    withIdentClause(ctx.identifierReference(), nameParts =>
+      AnalyzeClusteringQualityCommand(nameParts))
+  }
+
+  /**
    * Create a [[SetCommand]] logical plan.
    *
    * Note that we assume that everything after the SET keyword is assumed to be a part of the
