@@ -28,15 +28,16 @@ import org.apache.spark.sql.types.StringType
  * The logical plan of `ANALYZE TABLE t COMPUTE CLUSTERING QUALITY`.
  *
  * A '''read-only''' probe (no commit, no property write) that reports how well a table is clustered
- * to its CURRENT key selection, using only what OPTIMIZE persists (`optimize.cluster.state`)
- * plus manifest metrics (`t.files`). Designed to back an operational SLA of the form
- * "P% of data is clustered to quality X within Y hours"; whether that yields data skipping is the
- * customer's own validation (query-pattern dependent, deliberately out of scope).
+ * to its CURRENT key selection, using only what OPTIMIZE persists (`optimize.cluster.state`) plus
+ * manifest metrics (`t.files`). Designed to back an operational SLA of the form "P% of data is
+ * clustered to quality X within Y hours"; whether that yields data skipping is the customer's own
+ * validation (query-pattern dependent, deliberately out of scope).
+ *
+ * All metrics are computed with '''distributed SQL over metadata''' (an aggregate for coverage, a
+ * windowed sweep for depth) rather than collecting per-file rows to the driver, so the command is
+ * safe on tables with very large file counts.
  *
  * Output rows: `(metric, dimension, value)` where `dimension` is set only for per-key depth rows.
- * Key metrics: `coverage_bytes_pct` / `coverage_files_pct` (fraction whose leading-key range was
- * clustered under the current config), `depth_*` (Snowflake-style stabbing depth, global and over
- * the covered region), and `unclustered_tail_hours` (age of the oldest not-yet-clustered data).
  */
 case class AnalyzeClusteringQualityCommand(nameParts: Seq[String]) extends LeafRunnableCommand {
 
@@ -86,44 +87,46 @@ case class AnalyzeClusteringQualityCommand(nameParts: Seq[String]) extends LeafR
     val leadType = sparkSession.table(qualified).schema(leadKey).dataType.sql
     val current = parseState(props.getOrElse(STATE_PROP, "")).filter(_.config == cfgId)
 
-    // One pass over manifest metrics: per-file bytes, whether the leading-key range is covered by a
-    // current-config interval, and per-key bounds (typed) for depth.
-    val loExpr = metricExpr(leadKey, "lower_bound")
-    val hiExpr = metricExpr(leadKey, "upper_bound")
-    val coveredCol = coveragePredicate(loExpr, hiExpr, current, leadType)
-    val boundCols = keys.flatMap { k =>
-      Seq(s"${metricExpr(k, "lower_bound")} AS `${k}__lo`",
-        s"${metricExpr(k, "upper_bound")} AS `${k}__hi`")
-    }
-    val files = sparkSession.sql(
-      s"""SELECT file_size_in_bytes AS bytes, coalesce($coveredCol, false) AS covered,
-         |  ($loExpr IS NULL OR $hiExpr IS NULL) AS lead_null, ${boundCols.mkString(", ")}
-         |FROM $qualified.files""".stripMargin).collect()
-
-    val bytesTotal = files.map(_.getLong(0)).sum
-    val bytesCovered = files.filter(_.getBoolean(1)).map(_.getLong(0)).sum
-    val nullBytes = files.filter(_.getBoolean(2)).map(_.getLong(0)).sum
-    emit("files_total", files.length.toString)
-    emit("files_covered", files.count(_.getBoolean(1)).toString)
+    // Coverage: a file is covered iff its leading-key range fits inside a current-config interval.
+    // Computed as one aggregate over manifest metrics -- no per-file collect.
+    val leadLo = metricExpr(leadKey, "lower_bound")
+    val leadHi = metricExpr(leadKey, "upper_bound")
+    val coveredExpr = coveragePredicate(leadLo, leadHi, current, leadType)
+    val a = sparkSession.sql(
+      s"""SELECT count(*) AS files_total,
+         |  coalesce(sum(file_size_in_bytes), 0) AS bytes_total,
+         |  coalesce(sum(CASE WHEN cov THEN 1 ELSE 0 END), 0) AS files_covered,
+         |  coalesce(sum(CASE WHEN cov THEN file_size_in_bytes ELSE 0 END), 0) AS bytes_covered,
+         |  coalesce(sum(CASE WHEN lead_null THEN file_size_in_bytes ELSE 0 END), 0) AS null_bytes
+         |FROM (SELECT file_size_in_bytes,
+         |        coalesce($coveredExpr, false) AS cov,
+         |        ($leadLo IS NULL OR $leadHi IS NULL) AS lead_null
+         |      FROM $qualified.files)""".stripMargin).collect().head
+    val filesTotal = a.getLong(0)
+    val bytesTotal = a.getLong(1)
+    val filesCovered = a.getLong(2)
+    val bytesCovered = a.getLong(3)
+    val nullBytes = a.getLong(4)
+    emit("files_total", filesTotal.toString)
+    emit("files_covered", filesCovered.toString)
     emit("bytes_total", bytesTotal.toString)
     emit("bytes_covered", bytesCovered.toString)
     emit("coverage_bytes_pct", pct(bytesCovered, bytesTotal))
-    emit("coverage_files_pct", pct(files.count(_.getBoolean(1)).toLong, files.length.toLong))
+    emit("coverage_files_pct", pct(filesCovered, filesTotal))
     emit("null_bound_bytes_pct", pct(nullBytes, bytesTotal))
 
     // Depth per clustering dimension: global and over the covered region only (the SLA input).
-    keys.zipWithIndex.foreach { case (k, i) =>
-      val loIdx = 3 + i * 2
-      val hiIdx = loIdx + 1
-      val all = files.flatMap(r => bounds(r, loIdx, hiIdx))
-      val cov = files.filter(_.getBoolean(1)).flatMap(r => bounds(r, loIdx, hiIdx))
-      val gd = depth(all)
-      val cd = depth(cov)
-      emitDim("depth_avg", k, fmt(gd.avg))
-      emitDim("depth_p90", k, fmt(gd.p90))
-      emitDim("depth_max", k, gd.max.toString)
-      emitDim("depth_avg_covered", k, fmt(cd.avg))
-      emitDim("depth_p90_covered", k, fmt(cd.p90))
+    // Each is a windowed stabbing-count sweep over metadata, kept off the driver.
+    keys.foreach { k =>
+      val kLo = metricExpr(k, "lower_bound")
+      val kHi = metricExpr(k, "upper_bound")
+      val g = depthStats(sparkSession, qualified, kLo, kHi, None)
+      val c = depthStats(sparkSession, qualified, kLo, kHi, Some(coveredExpr))
+      emitDim("depth_avg", k, fmt(g.avg))
+      emitDim("depth_p90", k, fmt(g.p90))
+      emitDim("depth_max", k, g.max.toString)
+      emitDim("depth_avg_covered", k, fmt(c.avg))
+      emitDim("depth_p90_covered", k, fmt(c.p90))
     }
 
     emit("unclustered_tail_hours", tailHours(sparkSession, qualified, props.get(HWM_PROP)))
@@ -162,44 +165,40 @@ object AnalyzeClusteringQualityCommand {
     }.mkString(" OR ")
   }
 
-  /** Stabbing-depth stats over a set of `[lower, upper]` intervals of one (Comparable) type. */
-  def depth(intervals: Seq[(Any, Any)]): DepthStats = {
-    if (intervals.isEmpty) return DepthStats(0.0, 0.0, 0L)
-    // +1 at each lower, -1 past each upper; at a tie, starts (+1) precede ends (-1) so touching
-    // intervals count as overlapping. Sample the running depth at each start event.
-    val events = intervals.flatMap { case (lo, hi) => Seq((lo, 1), (hi, -1)) }
-    val sorted = events.sortWith { (a, b) =>
-      val c = a._1.asInstanceOf[Comparable[Any]].compareTo(b._1)
-      if (c != 0) c < 0 else a._2 > b._2
-    }
-    var cur = 0L
-    var maxD = 0L
-    val starts = mutable.ArrayBuffer[Long]()
-    sorted.foreach { case (_, d) =>
-      cur += d
-      if (d == 1) {
-        starts += cur
-        if (cur > maxD) maxD = cur
-      }
-    }
-    DepthStats(starts.sum.toDouble / starts.size, percentile(starts.toSeq, 0.9), maxD)
-  }
-
-  private def percentile(values: Seq[Long], p: Double): Double = {
-    if (values.isEmpty) return 0.0
-    val s = values.sorted
-    val idx = math.max(0, math.min(s.length - 1, math.ceil(p * s.length).toInt - 1))
-    s(idx).toDouble
-  }
-
-  /** A file's [lower, upper] pair at the given row positions; None if either is null. */
-  private def bounds(r: Row, loIdx: Int, hiIdx: Int): Option[(Any, Any)] =
-    if (r.isNullAt(loIdx) || r.isNullAt(hiIdx)) None else Some((r.get(loIdx), r.get(hiIdx)))
-
   private def pct(part: Long, total: Long): String =
     if (total == 0) "0.0" else fmt(100.0 * part / total)
 
   private def fmt(d: Double): String = f"$d%.2f"
+
+  /**
+   * Stabbing-depth stats over the `[lower, upper]` intervals of one dimension, optionally
+   * restricted to the covered region. Computed with a windowed running-sum sweep in SQL (`+1` at
+   * each lower bound, `-1` past each upper, sampled at start events) so nothing is collected to the
+   * driver. Depth `1` means no overlap (perfectly clustered); higher means more interleaving.
+   */
+  private def depthStats(
+      spark: SparkSession,
+      qualified: String,
+      loExpr: String,
+      hiExpr: String,
+      coveredFilter: Option[String]): DepthStats = {
+    val extra = coveredFilter.map(f => s"AND coalesce($f, false)").getOrElse("")
+    val where = s"$loExpr IS NOT NULL AND $hiExpr IS NOT NULL $extra"
+    val q =
+      s"""WITH ev AS (
+         |  SELECT $loExpr AS pt, 1 AS delta FROM $qualified.files WHERE $where
+         |  UNION ALL
+         |  SELECT $hiExpr AS pt, -1 AS delta FROM $qualified.files WHERE $where
+         |),
+         |running AS (SELECT delta, sum(delta) OVER (ORDER BY pt, delta DESC) AS depth FROM ev)
+         |SELECT coalesce(avg(CASE WHEN delta = 1 THEN CAST(depth AS DOUBLE) END), 0.0),
+         |  coalesce(percentile_approx(
+         |    CASE WHEN delta = 1 THEN CAST(depth AS DOUBLE) END, 0.9), 0.0),
+         |  coalesce(max(depth), 0L)
+         |FROM running""".stripMargin
+    val r = spark.sql(q).collect().head
+    DepthStats(r.getDouble(0), r.getDouble(1), r.getLong(2))
+  }
 
   /**
    * Age in hours of the oldest not-yet-clustered data: the oldest non-replace snapshot committed

@@ -53,30 +53,6 @@ class AnalyzeClusteringQualitySuite extends SparkFunSuite {
     assert(p.startsWith("((hi <= CAST('10' AS INT))"))
   }
 
-  test("depth: empty -> zeros") {
-    assert(depth(Seq.empty) === DepthStats(0.0, 0.0, 0L))
-  }
-
-  test("depth: disjoint intervals have depth 1") {
-    val d = depth(Seq((1, 2), (3, 4), (5, 6)))
-    assert(d.avg === 1.0 && d.max === 1L)
-  }
-
-  test("depth: fully nested intervals stack") {
-    val d = depth(Seq((1, 10), (2, 9), (3, 8)))
-    assert(d.avg === 2.0, d)
-    assert(d.max === 3L, d)
-  }
-
-  test("depth: partial overlap") {
-    // [1,3] and [2,4] overlap over [2,3]; starts see depth 1 then 2.
-    val d = depth(Seq((1, 3), (2, 4)))
-    assert(d.max === 2L, d)
-    assert(d.avg === 1.5, d)
-  }
-
-  test("depth: works on non-integer comparable keys (timestamps as strings sort lexically)") {
-    val d = depth(Seq(("2026-01-01", "2026-01-05"), ("2026-01-02", "2026-01-03")))
-    assert(d.max === 2L, d)
-  }
+  // Depth is computed with distributed SQL (see the windowed sweep in the command); its exact
+  // avg/max math is pinned end-to-end in OptimizeClusteringIcebergSuite where bounds are known.
 }

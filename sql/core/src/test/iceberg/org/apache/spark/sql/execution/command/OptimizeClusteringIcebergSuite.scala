@@ -500,16 +500,17 @@ class OptimizeClusteringIcebergSuite extends QueryTest with SharedSparkSession {
     assert(scalar(analyzeRows(t))("coverage_bytes_pct").toDouble > 99.0, "FULL restores coverage")
   }
 
-  test("analyze: depth drops after clustering interleaved data") {
+  test("analyze: depth is high for interleaved data and drops after clustering") {
     val t = "ice.db.aq_depth"
     sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
-    // Three files, each spanning the whole key range -> fully interleaved (global depth ~3).
+    // Several files all spanning the key range [1,6] -> heavily interleaved -> depth well above 1.
+    // (Exact depth is file-layout dependent, so assert the direction, not a pinned value.)
     (1 to 3).foreach(_ => sql(s"INSERT INTO $t VALUES (1, 1), (6, 6)"))
     val before = dim(analyzeRows(t), "depth_avg", "ts").map(_.toDouble).getOrElse(0.0)
     assert(before >= 2.0, s"interleaved data should have high depth, got $before")
     sql(s"OPTIMIZE $t FULL").collect()
     val after = dim(analyzeRows(t), "depth_avg_covered", "ts").map(_.toDouble).getOrElse(99.0)
-    assert(after < before, s"clustering should reduce depth: $before -> $after")
+    assert(after <= 1.5 && after < before, s"clustering should reduce depth toward 1, got $after")
   }
 
   test("analyze: null leading-key bytes are reported and counted uncovered") {
