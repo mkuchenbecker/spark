@@ -656,4 +656,123 @@ class OptimizeClusteringIcebergSuite extends QueryTest with SharedSparkSession {
     assert(rows(t, "ts") === before, "data preserved after real SE + fallback")
     assert(hwm(t) !== expiredHwm, "watermark must be reset off the expired snapshot")
   }
+
+  // ---- Phase 2: column DDL between runs ----
+
+  // C1 -- adding a non-key column: null backfill preserved, incremental scope unaffected.
+  test("ddl: adding a non-key column preserves data and incremental scope") {
+    val t = "ice.db.add_col"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
+    (1 to 3).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    sql(s"ALTER TABLE $t ADD COLUMN note STRING")
+    assertIncrementalScope(t, "ts") {
+      (4 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10}, 'n$i')"))
+    }
+    assert(count(s"SELECT count(*) FROM $t WHERE note IS NULL") === 3, "old rows keep null note")
+  }
+
+  // C4 -- dropping the leading-key column must fail loudly, state untouched.
+  test("ddl: dropping the leading-key column makes OPTIMIZE fail loudly, state untouched") {
+    val t = "ice.db.drop_key"
+    sql(s"CREATE TABLE $t (ts INT, val INT, note STRING) USING iceberg " +
+      s"TBLPROPERTIES (${clustered("ts")})")
+    (1 to 3).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10}, 'n$i')"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    val stateBefore = prop(t, "optimize.cluster.state")
+    val hwmBefore = hwm(t)
+    sql(s"ALTER TABLE $t DROP COLUMN ts")
+    sql(s"INSERT INTO $t VALUES (40, 'n4')")
+    val e = intercept[Exception](sql(s"OPTIMIZE $t").collect())
+    val msg = messageChain(e).toLowerCase
+    assert(msg.contains("ts") || msg.contains("cannot") || msg.contains("resolve"),
+      s"drop of the leading key must fail loudly: ${messageChain(e).take(300)}")
+    assert(prop(t, "optimize.cluster.state") === stateBefore, "failed run must not advance state")
+    assert(hwm(t) === hwmBefore, "failed run must not advance the watermark")
+  }
+
+  // C6 -- renaming a NON-key column leaves incremental unaffected.
+  test("ddl: renaming a non-key column leaves incremental OPTIMIZE unaffected") {
+    val t = "ice.db.rename_nonkey"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
+    (1 to 3).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    sql(s"ALTER TABLE $t RENAME COLUMN val TO amount")
+    assertIncrementalScope(t, "ts") {
+      (4 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    }
+  }
+
+  // C7 -- promoting the leading-key type (int -> bigint) keeps scope/coverage correct.
+  test("ddl: promoting the leading-key type (int->bigint) keeps incremental correct") {
+    val t = "ice.db.promote_key"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
+    (1 to 3).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    sql(s"ALTER TABLE $t ALTER COLUMN ts TYPE BIGINT")
+    assertIncrementalScope(t, "ts") {
+      (4 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    }
+  }
+
+  // C8 -- reordering columns (field-id based) must not break incremental.
+  test("ddl: reordering columns leaves incremental OPTIMIZE correct") {
+    val t = "ice.db.reorder"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
+    (1 to 3).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    sql(s"ALTER TABLE $t ALTER COLUMN val FIRST")
+    assertIncrementalScope(t, "ts") {
+      (4 to 6).foreach(i => sql(s"INSERT INTO $t VALUES (${i * 10}, $i)"))
+    }
+  }
+
+  // ---- Phase 3: partition-spec DDL between runs ----
+
+  // P3 -- adding a second partition field.
+  test("ddl: adding a second partition field then incremental preserves data") {
+    val t = "ice.db.spec_add2"
+    sql(s"CREATE TABLE $t (ts TIMESTAMP, region STRING, val INT) USING iceberg " +
+      s"PARTITIONED BY (days(ts)) TBLPROPERTIES (${clustered("ts")})")
+    (1 to 3).foreach(i =>
+      sql(s"INSERT INTO $t VALUES (TIMESTAMP '2026-01-0$i 00:00:00', 'r$i', $i)"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    sql(s"ALTER TABLE $t ADD PARTITION FIELD region")
+    (4 to 6).foreach(i =>
+      sql(s"INSERT INTO $t VALUES (TIMESTAMP '2026-01-0$i 00:00:00', 'r$i', $i)"))
+    val before = rows(t, "ts")
+    sql(s"OPTIMIZE $t").collect()
+    assert(rows(t, "ts") === before, "data preserved after adding a partition field")
+  }
+
+  // P4 -- dropping a partition field.
+  test("ddl: dropping a partition field then incremental preserves data") {
+    val t = "ice.db.spec_drop"
+    sql(s"CREATE TABLE $t (ts TIMESTAMP, region STRING, val INT) USING iceberg " +
+      s"PARTITIONED BY (days(ts), region) TBLPROPERTIES (${clustered("ts")})")
+    (1 to 3).foreach(i =>
+      sql(s"INSERT INTO $t VALUES (TIMESTAMP '2026-01-0$i 00:00:00', 'r$i', $i)"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    sql(s"ALTER TABLE $t DROP PARTITION FIELD region")
+    (4 to 6).foreach(i =>
+      sql(s"INSERT INTO $t VALUES (TIMESTAMP '2026-01-0$i 00:00:00', 'r$i', $i)"))
+    val before = rows(t, "ts")
+    sql(s"OPTIMIZE $t").collect()
+    assert(rows(t, "ts") === before, "data preserved after dropping a partition field")
+  }
+
+  // P6 -- incremental scope proof holds across a partition-transform change.
+  test("ddl: incremental scope holds across a partition-transform change") {
+    val t = "ice.db.spec_scope"
+    sql(s"CREATE TABLE $t (ts TIMESTAMP, val INT) USING iceberg " +
+      s"PARTITIONED BY (days(ts)) TBLPROPERTIES (${clustered("ts")})")
+    (1 to 3).foreach(i =>
+      sql(s"INSERT INTO $t VALUES (TIMESTAMP '2026-01-0$i 00:00:00', $i)"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    sql(s"ALTER TABLE $t REPLACE PARTITION FIELD days(ts) WITH hours(ts)")
+    assertIncrementalScope(t, "ts") {
+      (4 to 6).foreach(i =>
+        sql(s"INSERT INTO $t VALUES (TIMESTAMP '2026-01-0$i 00:00:00', $i)"))
+    }
+  }
 }

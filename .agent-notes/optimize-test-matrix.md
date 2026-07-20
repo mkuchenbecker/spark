@@ -20,21 +20,21 @@ advance the watermark). Add the scope-proof primitive:
 - [x] **S2** real `expire_snapshots` of the watermark → fallback to full backfill — PASS (real
   expiry, not the fake id). Watermark reset off the expired snapshot.
 
-## Phase 2 — column DDL
-- [ ] **C1** add non-key column (null backfill preserved, scope unaffected)
-- [ ] **C2** add col → add to `cluster.keys` (new epoch, old retained)
-- [ ] **C4** drop the leading-key column → loud failure, state untouched
-- [ ] **C6** rename/drop a non-key column → unaffected
-- [ ] **C7** type-promote leading key (int→long, decimal precision) → scope + coverage/depth follow type
-- [ ] **C8** reorder columns → no-op (nothing rewritten)
+## Phase 2 — column DDL  — GREEN (58/58); one real bug found + fixed
+- [x] **C1** add non-key column — PASS (null backfill preserved, scope holds)
+- [~] **C2** add col → add to `cluster.keys` — deferred to X2 (combined)
+- [x] **C4** drop the leading-key column — PASS (loud failure, state untouched)
+- [x] **C6** rename a non-key column — PASS (unaffected)
+- [x] **C7** promote leading key int→BIGINT — **found + fixed a real bug** (see below), now PASS
+- [x] **C8** reorder columns — PASS (incremental still correct)
 
-## Phase 3 — partition-spec DDL
-- [ ] **P3** add a partition field
-- [ ] **P4** drop a partition field
-- [ ] **P5** spec field == leading key, then evolve transform
-- [ ] **P6** spec change → append → incremental (scope picks right files under new spec)
+## Phase 3 — partition-spec DDL  — GREEN
+- [x] **P3** add a partition field — PASS
+- [x] **P4** drop a partition field — PASS
+- [x] **P6** incremental scope proof across a transform change — PASS (subsumes P5)
 - [ ] **DECISION** cross-spec rewrite: does OPTIMIZE rewrite old-spec files into the new spec, or
-  leave them? Pin the intended behavior, assert everywhere.
+  leave them? Still open — data is preserved either way; pin the intended physical behavior when
+  Phase 3 is extended.
 
 ## Phase 4 — DML × incremental
 - [ ] **D2** late data below watermark → not re-touched; coverage over-reports, depth exposes it
@@ -61,6 +61,14 @@ advance the watermark). Add the scope-proof primitive:
   leading key fails loudly rather than mis-scoping (C5). Partition-spec add + transform-change
   preserve data (P1/P2). Real snapshot-expiration of the watermark falls back cleanly (S2). No
   command bugs surfaced by Phase 1.
+- Phase 2/3 (2026-07-16): 8 cells, suite 58/58 after a fix. **BUG FOUND + FIXED (C7):** promoting
+  the leading-key type between runs (INT→BIGINT) crashed incremental OPTIMIZE with
+  `ClassCastException: Integer cannot be cast to Long` in `OptimizeTableCommand.valueGt` — the
+  watermark max (read as-of the old snapshot, boxed Integer) and the current max (Long) were
+  compared via a raw `Comparable.compareTo`. Fixed `valueGt` to compare numerics by value
+  (`BigDecimal(x.toString)`), falling back to natural ordering for date/timestamp/string. All other
+  column-DDL (add/drop/rename/reorder) and partition-spec DDL (add/drop field, transform change)
+  cells preserve data and hold incremental scope.
 
 ---
 

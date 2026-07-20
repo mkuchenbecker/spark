@@ -354,9 +354,18 @@ object OptimizeTableCommand {
     cond.expr.sql
   }
 
-  /** True if `a > b` for two values of the same (Comparable) leading-key type. */
-  private def valueGt(a: Any, b: Any): Boolean =
-    a.asInstanceOf[Comparable[Any]].compareTo(b) > 0
+  /**
+   * True if `a > b` for two leading-key values. The two values can be read under different schema
+   * versions when the leading key is type-promoted between runs (e.g. INT -> BIGINT): the watermark
+   * max comes back boxed as Integer and the current max as Long, which a raw Comparable.compareTo
+   * cannot compare (ClassCastException). Numeric values are therefore compared by value; other
+   * comparable types (date / timestamp / string, which do not change type under an Iceberg
+   * promotion) fall back to natural ordering.
+   */
+  private def valueGt(a: Any, b: Any): Boolean = (a, b) match {
+    case (x: Number, y: Number) => BigDecimal(x.toString) > BigDecimal(y.toString)
+    case _ => a.asInstanceOf[Comparable[Any]].compareTo(b) > 0
+  }
 
   private def snapshotCount(spark: SparkSession, qualified: String): Long =
     spark.sql(s"SELECT count(*) FROM $qualified.snapshots").collect().head.getLong(0)
