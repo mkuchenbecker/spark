@@ -7,19 +7,18 @@ Full rationale/matrix at the bottom; this top section is the live checklist.
 ## Assertion bar (foundation — do first)
 The current `assertPreserves` cannot distinguish incremental from full (both preserve data + commit +
 advance the watermark). Add the scope-proof primitive:
-- [ ] **F1** `assertIncrementalScope` helper: capture `dataFiles` after run 1; append forward-slice
-  data; run incremental; assert the run-1 file set is a **subset** of the post-run-2 file set (old
-  clustered files NOT rewritten) AND the appended files WERE rewritten (removed). Uses existing
-  `dataFiles(t): Set[String]`.
+- [x] **F1** `assertIncrementalScope` helper — DONE. Uses `dataFiles`; asserts run-1 files ⊆
+  post-run-2 files (old clustered files not rewritten) AND appended files were rewritten.
 
-## Phase 1 — highest risk / zero current coverage
-- [ ] **D1** forward-slice append → incremental rewrites only the new slice (F1 assertion). THE core.
-- [ ] **C5** rename the leading-key column between runs → must not silently mis-scope. Probe actual
-  behavior first; assert loud failure or correct handling (never silent wrong scope).
-- [ ] **P1** unpartitioned → `ALTER TABLE ADD PARTITION FIELD days(ts)` → append → incremental.
-- [ ] **P2** `days(ts)` → `hours(ts)` transform change → append → incremental.
-- [ ] **S2** real SE: `expire_snapshots` expires the watermark snapshot → fallback to full backfill
-  (replaces the current fake-`999999`-id test with a real expiry).
+## Phase 1 — highest risk / zero current coverage  — ALL GREEN (50/50 suite)
+- [x] **D1** incremental rewrites only the new slice — PASS. Proves the command genuinely scopes
+  (old clustered files survive untouched). The previously-missing core assertion now exists + passes.
+- [x] **C5** rename leading-key column — PASS. OPTIMIZE **fails loudly** (rewrite aborts →
+  exception); state + watermark left untouched. No silent mis-scope. Good behavior, now pinned.
+- [x] **P1** add `days(ts)` partition field → incremental — PASS. Data preserved across spec add.
+- [x] **P2** `days(ts)`→`hours(ts)` transform change → incremental — PASS. Data preserved.
+- [x] **S2** real `expire_snapshots` of the watermark → fallback to full backfill — PASS (real
+  expiry, not the fake id). Watermark reset off the expired snapshot.
 
 ## Phase 2 — column DDL
 - [ ] **C1** add non-key column (null backfill preserved, scope unaffected)
@@ -57,7 +56,11 @@ advance the watermark). Add the scope-proof primitive:
 - [ ] **X4** SE + spec change + incremental
 
 ## Execution notes (append findings here)
-- (findings/bugs surfaced by the tests go here as they happen)
+- Phase 1 (2026-07-16): all 5 cells green, suite 50/50. Key result — **incremental is genuinely
+  incremental** (D1 scope proof passes: already-clustered files are not rewritten). Rename of the
+  leading key fails loudly rather than mis-scoping (C5). Partition-spec add + transform-change
+  preserve data (P1/P2). Real snapshot-expiration of the watermark falls back cleanly (S2). No
+  command bugs surfaced by Phase 1.
 
 ---
 

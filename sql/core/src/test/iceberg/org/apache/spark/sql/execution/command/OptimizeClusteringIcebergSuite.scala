@@ -85,6 +85,30 @@ class OptimizeClusteringIcebergSuite extends QueryTest with SharedSparkSession {
     s"'optimize.cluster.keys'='$keys', 'optimize.cluster.sort-mode'='$sortMode', " +
       s"'optimize.cluster.min-snapshot-age-minutes'='$minAge'"
 
+  /**
+   * Scope proof for an incremental run: `assertPreserves` alone can't tell incremental from full
+   * (both preserve data + commit). This captures the already-clustered file set, runs `appendSlice`
+   * (which must add a forward slice strictly above the current clustered max), then an incremental
+   * OPTIMIZE, and asserts the previously-clustered files were NOT rewritten while the appended
+   * slice WAS -- i.e. the run really only touched the new slice.
+   */
+  private def assertIncrementalScope(t: String, orderBy: String)(appendSlice: => Unit): Unit = {
+    val clusteredFiles = dataFiles(t)
+    appendSlice
+    val appended = dataFiles(t) -- clusteredFiles
+    assert(appended.nonEmpty, "test setup: appendSlice must add data files")
+    val before = rows(t, orderBy)
+    sql(s"OPTIMIZE $t").collect()
+    assert(rows(t, orderBy) === before, "incremental OPTIMIZE must preserve query results")
+    val after = dataFiles(t)
+    assert(clusteredFiles.subsetOf(after),
+      "incremental must NOT rewrite already-clustered files; " +
+        s"rewritten=${(clusteredFiles -- after).take(3)}")
+    val stillRaw = appended.intersect(after)
+    assert(stillRaw.isEmpty,
+      s"incremental must rewrite the appended slice; still-raw=${stillRaw.take(3)}")
+  }
+
   // ---------------------------------------------------------------------------------------------
   // Partition schemes -- clustering must work and preserve data on every partition transform.
   // ---------------------------------------------------------------------------------------------
@@ -551,5 +575,85 @@ class OptimizeClusteringIcebergSuite extends QueryTest with SharedSparkSession {
       sql("ANALYZE TABLE ice.db.no_such_analyze_table COMPUTE CLUSTERING QUALITY").collect())
     assert(messageChain(e).contains("no_such_analyze_table"),
       s"error must name the missing table: ${messageChain(e).take(300)}")
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // DML/DDL evolution between incremental runs (scope proof, column + partition-spec DDL, real SE).
+  // ---------------------------------------------------------------------------------------------
+
+  // D1 -- the core: an incremental run must touch ONLY the new forward slice.
+  test("incremental: rewrites only the new forward slice, not already-clustered files") {
+    val t = "ice.db.inc_scope"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
+    (1 to 3).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    assertIncrementalScope(t, "ts") {
+      // forward slice strictly above the clustered max (3), as multiple files to force a rewrite
+      (4 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    }
+  }
+
+  // C5 -- renaming the leading-key column must not silently mis-scope.
+  test("ddl: renaming the leading-key column makes OPTIMIZE fail loudly, not mis-scope") {
+    val t = "ice.db.rename_key"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
+    (1 to 3).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    val stateBefore = prop(t, "optimize.cluster.state")
+    val hwmBefore = hwm(t)
+    sql(s"ALTER TABLE $t RENAME COLUMN ts TO event_ts")
+    (4 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    val e = intercept[Exception](sql(s"OPTIMIZE $t").collect())
+    val msg = messageChain(e).toLowerCase
+    assert(msg.contains("ts") || msg.contains("cannot") || msg.contains("resolve"),
+      s"rename of the leading key must fail loudly: ${messageChain(e).take(300)}")
+    assert(rowCount(t) === 6, "data must be intact after the failed run")
+    assert(prop(t, "optimize.cluster.state") === stateBefore, "failed run must not advance state")
+    assert(hwm(t) === hwmBefore, "failed run must not advance the watermark")
+  }
+
+  // P1 -- partition spec evolution: unpartitioned -> add days(ts), then incremental.
+  test("ddl: adding a partition field (days(ts)) then incremental preserves data") {
+    val t = "ice.db.spec_add"
+    sql(s"CREATE TABLE $t (ts TIMESTAMP, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
+    (1 to 3).foreach(i => sql(s"INSERT INTO $t VALUES (TIMESTAMP '2026-01-0$i 00:00:00', $i)"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    sql(s"ALTER TABLE $t ADD PARTITION FIELD days(ts)")
+    (4 to 6).foreach(i => sql(s"INSERT INTO $t VALUES (TIMESTAMP '2026-01-0$i 00:00:00', $i)"))
+    val before = rows(t, "ts")
+    sql(s"OPTIMIZE $t").collect()
+    assert(rows(t, "ts") === before, "data must be preserved across partition-spec evolution")
+    assert(rowCount(t) === 6)
+  }
+
+  // P2 -- partition transform change: days(ts) -> hours(ts), then incremental.
+  test("ddl: changing a partition transform (days->hours) then incremental preserves data") {
+    val t = "ice.db.spec_xform"
+    sql(s"CREATE TABLE $t (ts TIMESTAMP, val INT) USING iceberg PARTITIONED BY (days(ts)) " +
+      s"TBLPROPERTIES (${clustered("ts")})")
+    (1 to 3).foreach(i => sql(s"INSERT INTO $t VALUES (TIMESTAMP '2026-01-0$i 00:00:00', $i)"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    sql(s"ALTER TABLE $t REPLACE PARTITION FIELD days(ts) WITH hours(ts)")
+    (4 to 6).foreach(i => sql(s"INSERT INTO $t VALUES (TIMESTAMP '2026-01-0$i 00:00:00', $i)"))
+    val before = rows(t, "ts")
+    sql(s"OPTIMIZE $t").collect()
+    assert(rows(t, "ts") === before, "data must be preserved across a partition-transform change")
+  }
+
+  // S2 -- REAL snapshot expiration of the watermark snapshot must fall back to a full backfill.
+  test("state: real snapshot expiration of the watermark falls back to a full backfill") {
+    val t = "ice.db.se_wm"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
+    (1 to 3).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    val expiredHwm = hwm(t)
+    (4 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    // Really expire every snapshot but the head -- including the one the watermark points at.
+    sql(s"CALL ice.system.expire_snapshots(table => 'db.se_wm', " +
+      s"older_than => TIMESTAMP '2999-01-01 00:00:00', retain_last => 1)")
+    val before = rows(t, "ts")
+    sql(s"OPTIMIZE $t").collect()
+    assert(rows(t, "ts") === before, "data preserved after real SE + fallback")
+    assert(hwm(t) !== expiredHwm, "watermark must be reset off the expired snapshot")
   }
 }
