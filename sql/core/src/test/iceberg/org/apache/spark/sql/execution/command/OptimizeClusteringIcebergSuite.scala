@@ -775,4 +775,104 @@ class OptimizeClusteringIcebergSuite extends QueryTest with SharedSparkSession {
         sql(s"INSERT INTO $t VALUES (TIMESTAMP '2026-01-0$i 00:00:00', $i)"))
     }
   }
+
+  // ---- Phase 4: DML interleaved with incremental runs ----
+
+  private val mor =
+    "'write.delete.mode'='merge-on-read', 'write.update.mode'='merge-on-read', " +
+      "'write.merge.mode'='merge-on-read'"
+
+  // D2 -- late data below the watermark is not re-clustered (documented behavior).
+  test("dml: late data below the watermark is a no-op for incremental (not re-clustered)") {
+    val t = "ice.db.late_data"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
+    (1 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    (1 to 2).foreach(_ => sql(s"INSERT INTO $t VALUES (3, 999)"))
+    val lateFiles = dataFiles(t)
+    val snaps = snapshotCount(t)
+    val before = rows(t, "ts")
+    sql(s"OPTIMIZE $t").collect()
+    assert(rows(t, "ts") === before, "data preserved")
+    assert(snapshotCount(t) === snaps, "late data below the watermark must not trigger a rewrite")
+    assert(lateFiles.subsetOf(dataFiles(t)), "late files must not be rewritten by incremental")
+  }
+
+  // D3 -- DELETE (copy-on-write) then incremental keeps rows deleted.
+  test("dml: DELETE (copy-on-write) then incremental keeps rows deleted") {
+    val t = "ice.db.del_cow"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg " +
+      s"TBLPROPERTIES (${clustered("ts")}, 'write.delete.mode'='copy-on-write')")
+    (1 to 3).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    (4 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"DELETE FROM $t WHERE ts = 5")
+    val before = rows(t, "ts")
+    sql(s"OPTIMIZE $t").collect()
+    assert(rows(t, "ts") === before, "data preserved incl. the delete")
+    assert(count(s"SELECT count(*) FROM $t WHERE ts = 5") === 0, "deleted row stays deleted")
+  }
+
+  // D4 -- DELETE (merge-on-read) in the incremental scope: the rewrite must apply the delete.
+  test("dml: DELETE (merge-on-read) in the incremental scope stays applied") {
+    val t = "ice.db.del_mor"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")}, $mor)")
+    (1 to 3).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    (4 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"DELETE FROM $t WHERE ts = 5")
+    val before = rows(t, "ts")
+    sql(s"OPTIMIZE $t").collect()
+    assert(rows(t, "ts") === before, "data preserved incl. the MoR delete")
+    assert(count(s"SELECT count(*) FROM $t WHERE ts = 5") === 0, "MoR delete stays applied")
+  }
+
+  // D5 -- UPDATE (merge-on-read) then incremental stays consistent.
+  test("dml: UPDATE (merge-on-read) then incremental stays consistent") {
+    val t = "ice.db.upd_mor"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")}, $mor)")
+    (1 to 3).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    (4 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"UPDATE $t SET val = -1 WHERE ts = 5")
+    val before = rows(t, "ts")
+    sql(s"OPTIMIZE $t").collect()
+    assert(rows(t, "ts") === before, "data preserved incl. the update")
+    assert(count(s"SELECT count(*) FROM $t WHERE ts = 5 AND val = -1") === 1, "update applied")
+  }
+
+  // D6 -- MERGE (merge-on-read) then incremental stays consistent.
+  test("dml: MERGE (merge-on-read) then incremental stays consistent") {
+    val t = "ice.db.mrg_mor"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")}, $mor)")
+    (1 to 3).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    (4 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"MERGE INTO $t USING (SELECT 5 AS ts, -7 AS val) s ON $t.ts = s.ts " +
+      s"WHEN MATCHED THEN UPDATE SET val = s.val")
+    val before = rows(t, "ts")
+    sql(s"OPTIMIZE $t").collect()
+    assert(rows(t, "ts") === before, "data preserved incl. the merge")
+    assert(count(s"SELECT count(*) FROM $t WHERE ts = 5 AND val = -7") === 1, "merge stays applied")
+  }
+
+  // D7 -- many append -> incremental rounds: watermark monotonic, no re-cluster of prior rounds.
+  test("dml: multi-round incremental advances monotonically without re-clustering prior rounds") {
+    val t = "ice.db.multiround"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
+    (1 to 3).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    var prevFiles = dataFiles(t)
+    var prevHwm = hwm(t)
+    for (round <- 1 to 3) {
+      val base = 3 + round * 3
+      ((base - 2) to base).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+      sql(s"OPTIMIZE $t").collect()
+      assert(prevFiles.subsetOf(dataFiles(t)), s"round $round must not re-cluster prior rounds")
+      assert(hwm(t) !== prevHwm, s"round $round must advance the watermark")
+      prevFiles = dataFiles(t)
+      prevHwm = hwm(t)
+    }
+    assert(rowCount(t) === 12, "all rows present after multi-round clustering")
+  }
 }

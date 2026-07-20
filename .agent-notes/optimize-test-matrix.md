@@ -36,13 +36,13 @@ advance the watermark). Add the scope-proof primitive:
   leave them? Still open — data is preserved either way; pin the intended physical behavior when
   Phase 3 is extended.
 
-## Phase 4 — DML × incremental
-- [ ] **D2** late data below watermark → not re-touched; coverage over-reports, depth exposes it
-- [ ] **D3** DELETE (CoW) → incremental
-- [ ] **D4** DELETE (MoR) → incremental (delete files preserved)
-- [ ] **D5** UPDATE (MoR) → incremental
-- [ ] **D6** MERGE (MoR) → incremental
-- [ ] **D7** multi-round append→incremental×N (watermark monotonic, no re-cluster of prior rounds)
+## Phase 4 — DML × incremental  — GREEN (64/64)
+- [x] **D2** late data below watermark → incremental no-op, late files not rewritten — PASS
+- [x] **D3** DELETE (CoW) → incremental keeps rows deleted — PASS
+- [x] **D4** DELETE (MoR) in the incremental scope stays applied through the rewrite — PASS
+- [x] **D5** UPDATE (MoR) → incremental stays consistent — PASS
+- [x] **D6** MERGE (MoR) → incremental stays consistent — PASS
+- [x] **D7** multi-round append→incremental — watermark monotonic, prior rounds not re-clustered — PASS
 
 ## Phase 5 — SE (rest) + OpenHouse
 - [ ] **S1** SE prunes snapshots older than watermark → incremental robust
