@@ -92,20 +92,20 @@ case class OptimizeTableCommand(
     val filesBefore = dataFileCount(sparkSession, qualified)
     val snapshotsBefore = snapshotCount(sparkSession, qualified)
 
-    val props = tableProperties(sparkSession, qualified)
-    val keys = props.get(KEYS_PROP)
-      .map(_.split(",").map(_.trim).filter(_.nonEmpty).toSeq)
-      .getOrElse(Seq.empty)
+    val props = sparkSession.sql(s"SHOW TBLPROPERTIES $qualified").collect()
+      .map(r => r.getString(0) -> r.getString(1)).toMap
+    val config = parseClusterConfig(props)
 
-    if (keys.isEmpty) {
+    if (config.keys.isEmpty) {
       // No clustering configured: plain bin-pack compaction (unchanged historical behavior).
-      sparkSession.sql(compactionCall(cat, tableArg)).collect()
+      sparkSession.sql(s"CALL $cat.system.rewrite_data_files(table => '$tableArg')").collect()
     } else {
-      cluster(sparkSession, cat, tableArg, qualified, props, keys)
+      cluster(sparkSession, cat, tableArg, qualified, config)
     }
 
     if (rewriteManifests) {
-      sparkSession.sql(rewriteManifestsCall(cat, tableArg)).collect()
+      // Independent manifest compaction; runs after the data rewrite so it sees the new layout.
+      sparkSession.sql(s"CALL $cat.system.rewrite_manifests(table => '$tableArg')").collect()
     }
 
     val filesAfter = dataFileCount(sparkSession, qualified)
@@ -122,17 +122,15 @@ case class OptimizeTableCommand(
       cat: String,
       tableArg: String,
       qualified: String,
-      props: Map[String, String],
-      keys: Seq[String]): Unit = {
-    val sortMode = props.getOrElse(SORT_MODE_PROP, DEFAULT_SORT_MODE)
-    val minAgeMinutes = props.get(MIN_SNAPSHOT_AGE_PROP).map(_.toLong)
-      .getOrElse(DEFAULT_MIN_SNAPSHOT_AGE_MINUTES)
-    val maxCommits = props.get(MAX_COMMITS_PROP).map(_.toLong).getOrElse(DEFAULT_MAX_COMMITS)
-    val hwm = props.get(HWM_PROP).map(_.toLong)
+      config: ClusterConfig): Unit = {
+    import config.{hwm, keys, maxCommits, minAgeMinutes, sortMode, state}
 
     // Age floor: the newest snapshot at least `minAgeMinutes` old, by commit time. Everything
     // younger is held back so we never rewrite files a concurrent streaming writer is extending.
-    val ageFloor = ageFloorSnapshot(spark, qualified, minAgeMinutes)
+    val ageFloor = spark.sql(
+      s"""SELECT snapshot_id FROM $qualified.snapshots
+         |WHERE committed_at <= current_timestamp() - INTERVAL $minAgeMinutes MINUTES
+         |ORDER BY committed_at DESC LIMIT 1""".stripMargin).collect().headOption.map(_.getLong(0))
     if (ageFloor.isEmpty) return // nothing old enough to consume yet -> no-op
 
     val floorId = ageFloor.get
@@ -149,36 +147,70 @@ case class OptimizeTableCommand(
     // Lower bound: incremental runs skip what a prior run already clustered (the leading-key max at
     // the previous watermark). FULL ignores it and reclusters everything up to the floor. A missing
     // (expired) watermark falls back to a full backfill up to the floor.
+    // A since-expired watermark yields None here -> a full backfill up to the floor.
     val hwmMax =
-      if (full) None else hwm.flatMap(h => leadKeyMaxOrNone(spark, qualified, leadKey, h))
+      if (full) None
+      else hwm.flatMap { h =>
+        try leadKeyMax(spark, qualified, leadKey, Some(h)) catch { case NonFatal(_) => None }
+      }
 
-    // True no-op: an incremental run whose leading key has not advanced past the previous watermark
-    // has nothing to recluster; leave the watermark in place rather than churning an empty rewrite.
-    if (hwmMax.exists(lo => !valueGt(floorMax.get, lo))) return
+    // No-op if the leading key has not advanced past the previous watermark. Compare numerics by
+    // value so a leading key promoted between runs (INT -> BIGINT: a boxed Integer watermark max vs
+    // a Long current max) still compares rather than throwing a ClassCastException; date/timestamp/
+    // string keys (which don't change type under an Iceberg promotion) use natural ordering.
+    val advanced = hwmMax.forall { lo =>
+      (floorMax.get, lo) match {
+        case (x: Number, y: Number) => BigDecimal(x.toString) > BigDecimal(y.toString)
+        case (x, y) => x.asInstanceOf[Comparable[Any]].compareTo(y) > 0
+      }
+    }
+    if (!advanced) return
 
-    val predicate = scopePredicate(leadKey, hwmMax, floorMax.get)
-    // The scope is non-empty (data exists at/below floorMax) and `rewrite-all` forces a rewrite, so
-    // a healthy run always commits a new snapshot. If nothing committed, the rewrite failed
-    // systemically -- partial progress swallows per-group failures, which would otherwise leave a
-    // silent no-op. Fail loudly and leave the watermark unadvanced so the run is retryable.
+    // The `where` slice to recluster: `lead <= floorMax`, plus `lead > hwmMax` for an incremental
+    // run. Catalyst renders each key-type literal correctly, then the predicate is embedded as
+    // a SQL string literal so its own quotes (string / timestamp / date literals) survive the CALL.
+    val lead = col(quoteIfNeeded(leadKey))
+    val scope = hwmMax.map(lo => (lead > lit(lo)) && (lead <= lit(floorMax.get)))
+      .getOrElse(lead <= lit(floorMax.get)).expr.sql
+    val cols = keys.map(quoteIfNeeded).mkString(", ")
+    val sortOrder = if (sortMode.equalsIgnoreCase("zorder")) s"zorder($cols)" else cols
+
+    // Scoped sort / z-order rewrite with partial progress: min-input-files=1 + rewrite-all=true
+    // cluster the region regardless of file count (optimization, not compaction);
+    // use-starting-sequence-number keeps concurrent equality-deletes valid. rewrite-all forces a
+    // rewrite over the non-empty scope, so a healthy run always commits a snapshot; if none is
+    // committed the rewrite failed systemically (partial progress swallows per-group failures), so
+    // fail loudly and leave the watermark unadvanced for a retry.
     val snapshotsBefore = snapshotCount(spark, qualified)
-    spark.sql(clusterCall(cat, tableArg, sortMode, keys, predicate, maxCommits)).collect()
+    spark.sql(
+      s"CALL $cat.system.rewrite_data_files(" +
+        s"table => '$tableArg', " +
+        "strategy => 'sort', " +
+        s"sort_order => '$sortOrder', " +
+        s"where => ${Literal(scope).sql}, " +
+        "options => map(" +
+        "'min-input-files', '1', " +
+        "'rewrite-all', 'true', " +
+        "'use-starting-sequence-number', 'true', " +
+        "'partial-progress.enabled', 'true', " +
+        s"'partial-progress.max-commits', '$maxCommits'))").collect()
     if (snapshotCount(spark, qualified) <= snapshotsBefore) {
       throw new IllegalStateException(
-        s"OPTIMIZE clustered no data for '$qualified': the rewrite committed no snapshot despite " +
-          "a non-empty scope. This usually means an unsupported clustering configuration -- for " +
-          "example, z-order (sort-mode=zorder) on a column type Iceberg cannot z-order, such as " +
-          s"decimal. Keys=[${keys.mkString(",")}], sort-mode=$sortMode.")
+        s"OPTIMIZE clustered no data for '$qualified' despite a non-empty scope: z-order " +
+          s"(sort-mode=$sortMode) cannot be applied to some column types (e.g. decimal). " +
+          s"Keys=[${keys.mkString(",")}], sort-mode=$sortMode.")
     }
-    // Advance the clustering metadata in a single commit: the watermark (consumed age floor, not
-    // head), the current config id, and the interval state that records which leading-key range is
-    // now clustered under which key selection. These are one logical fact, so they must land
-    // together; a missing (expired) watermark rewrote from -inf, so the epoch has no lower bound.
+
+    // Advance all clustering metadata in one ALTER TABLE -- the watermark (the consumed age floor,
+    // not head), the config id, and the interval state -- so they never disagree across a crash.
     val cfgId = configId(keys, sortMode)
     val newState = advanceState(
-      parseState(props.getOrElse(STATE_PROP, "")),
-      cfgId, keys, sortMode, hwmMax.map(renderValue), renderValue(floorMax.get), full)
-    spark.sql(setClusterMetaCall(cat, tableArg, floorId, cfgId, renderState(newState))).collect()
+      state, cfgId, keys, sortMode, hwmMax.map(_.toString), floorMax.get.toString, full)
+    spark.sql(
+      s"ALTER TABLE $cat.$tableArg SET TBLPROPERTIES (" +
+        s"'$HWM_PROP' = '$floorId', " +
+        s"'$CONFIG_ID_PROP' = '$cfgId', " +
+        s"'$STATE_PROP' = ${Literal(renderState(newState)).sql})").collect()
   }
 }
 
@@ -195,6 +227,30 @@ object OptimizeTableCommand {
   val DEFAULT_SORT_MODE = "zorder"
   val DEFAULT_MIN_SNAPSHOT_AGE_MINUTES = 30L
   val DEFAULT_MAX_COMMITS = 10L
+
+  /**
+   * Clustering configuration resolved from the `optimize.cluster.*` table properties, with every
+   * default applied and every value parsed to its type. Resolved once so the rewrite path takes
+   * typed parameters instead of re-reading and re-parsing a raw property map.
+   */
+  case class ClusterConfig(
+      keys: Seq[String],
+      sortMode: String,
+      minAgeMinutes: Long,
+      maxCommits: Long,
+      hwm: Option[Long],
+      state: Seq[ClusterInterval])
+
+  /** Parse the `optimize.cluster.*` table properties into a typed [[ClusterConfig]]. */
+  def parseClusterConfig(props: Map[String, String]): ClusterConfig = ClusterConfig(
+    keys = props.get(KEYS_PROP)
+      .map(_.split(",").map(_.trim).filter(_.nonEmpty).toSeq).getOrElse(Seq.empty),
+    sortMode = props.getOrElse(SORT_MODE_PROP, DEFAULT_SORT_MODE),
+    minAgeMinutes = props.get(MIN_SNAPSHOT_AGE_PROP).map(_.toLong)
+      .getOrElse(DEFAULT_MIN_SNAPSHOT_AGE_MINUTES),
+    maxCommits = props.get(MAX_COMMITS_PROP).map(_.toLong).getOrElse(DEFAULT_MAX_COMMITS),
+    hwm = props.get(HWM_PROP).map(_.toLong),
+    state = parseState(props.getOrElse(STATE_PROP, "")))
 
   private val stateMapper = new ObjectMapper()
 
@@ -213,9 +269,6 @@ object OptimizeTableCommand {
     crc.update(normalized.getBytes(StandardCharsets.UTF_8))
     java.lang.Long.toHexString(crc.getValue)
   }
-
-  /** Render a leading-key value for storage; consumers CAST it back to the key type in SQL. */
-  def renderValue(v: Any): String = v.toString
 
   /** Serialize interval state to the JSON stored in `optimize.cluster.state`. For testing. */
   def renderState(intervals: Seq[ClusterInterval]): String = {
@@ -280,113 +333,11 @@ object OptimizeTableCommand {
     }
   }
 
-  /** The `CALL` for plain bin-pack compaction (no clustering configured). Exposed for testing. */
-  def compactionCall(catalog: String, table: String): String =
-    s"CALL $catalog.system.rewrite_data_files(table => '$table')"
-
-  /** The `CALL` for manifest compaction. Exposed for testing. */
-  def rewriteManifestsCall(catalog: String, table: String): String =
-    s"CALL $catalog.system.rewrite_manifests(table => '$table')"
-
-  /** The Iceberg `sort_order` expression for the configured mode and keys. Exposed for testing. */
-  def sortOrderExpr(sortMode: String, keys: Seq[String]): String = {
-    val cols = keys.map(quoteIfNeeded).mkString(", ")
-    if (sortMode.equalsIgnoreCase("zorder")) s"zorder($cols)" else cols
-  }
-
-  /**
-   * The clustering `CALL`: a scoped sort / z-order `rewrite_data_files` with partial progress.
-   * `min-input-files=1` + `rewrite-all=true` cluster the scoped region regardless of file count
-   * (optimization, not compaction); `use-starting-sequence-number=true` keeps concurrent
-   * equality-deletes valid; partial progress bounds snapshots per run. The `where` predicate is
-   * rendered as a SQL string literal via Catalyst so its own quotes (string / timestamp / date
-   * literals) survive the CALL's string-literal parsing. Exposed for testing.
-   */
-  def clusterCall(
-      catalog: String,
-      table: String,
-      sortMode: String,
-      keys: Seq[String],
-      whereClause: String,
-      maxCommits: Long): String = {
-    val order = sortOrderExpr(sortMode, keys)
-    s"CALL $catalog.system.rewrite_data_files(" +
-      s"table => '$table', " +
-      "strategy => 'sort', " +
-      s"sort_order => '$order', " +
-      s"where => ${Literal(whereClause).sql}, " +
-      "options => map(" +
-      "'min-input-files', '1', " +
-      "'rewrite-all', 'true', " +
-      "'use-starting-sequence-number', 'true', " +
-      "'partial-progress.enabled', 'true', " +
-      s"'partial-progress.max-commits', '$maxCommits'))"
-  }
-
-  /**
-   * The single `ALTER TABLE` that advances all clustering metadata at once -- watermark, config id,
-   * and interval state -- so they never disagree across a crash. The state JSON is embedded as a
-   * Catalyst string literal so its quotes/braces survive parsing. Exposed for testing.
-   */
-  def setClusterMetaCall(
-      catalog: String,
-      table: String,
-      snapshotId: Long,
-      cfgId: String,
-      stateJson: String): String =
-    s"ALTER TABLE $catalog.$table SET TBLPROPERTIES (" +
-      s"'$HWM_PROP' = '$snapshotId', " +
-      s"'$CONFIG_ID_PROP' = '$cfgId', " +
-      s"'$STATE_PROP' = ${Literal(stateJson).sql})"
-
-  /**
-   * The `where` predicate bounding the leading-key slice to recluster: `lead <= upper`, plus
-   * `lead > lower` for incremental runs. Literal formatting is delegated to Catalyst so every key
-   * type is rendered correctly. Exposed for testing.
-   */
-  def scopePredicate(leadKey: String, lower: Option[Any], upper: Any): String = {
-    val c = col(quoteIfNeeded(leadKey))
-    val upperCond = c <= lit(upper)
-    val cond = lower match {
-      case Some(lo) => (c > lit(lo)) && upperCond
-      case None => upperCond
-    }
-    cond.expr.sql
-  }
-
-  /**
-   * True if `a > b` for two leading-key values. The two values can be read under different schema
-   * versions when the leading key is type-promoted between runs (e.g. INT -> BIGINT): the watermark
-   * max comes back boxed as Integer and the current max as Long, which a raw Comparable.compareTo
-   * cannot compare (ClassCastException). Numeric values are therefore compared by value; other
-   * comparable types (date / timestamp / string, which do not change type under an Iceberg
-   * promotion) fall back to natural ordering.
-   */
-  private def valueGt(a: Any, b: Any): Boolean = (a, b) match {
-    case (x: Number, y: Number) => BigDecimal(x.toString) > BigDecimal(y.toString)
-    case _ => a.asInstanceOf[Comparable[Any]].compareTo(b) > 0
-  }
-
   private def snapshotCount(spark: SparkSession, qualified: String): Long =
     spark.sql(s"SELECT count(*) FROM $qualified.snapshots").collect().head.getLong(0)
 
   private def dataFileCount(spark: SparkSession, qualified: String): Long =
     spark.sql(s"SELECT count(*) FROM $qualified.files").collect().head.getLong(0)
-
-  private def tableProperties(spark: SparkSession, qualified: String): Map[String, String] =
-    spark.sql(s"SHOW TBLPROPERTIES $qualified").collect()
-      .map(r => r.getString(0) -> r.getString(1)).toMap
-
-  private def ageFloorSnapshot(
-      spark: SparkSession,
-      qualified: String,
-      minAgeMinutes: Long): Option[Long] = {
-    val rows = spark.sql(
-      s"""SELECT snapshot_id FROM $qualified.snapshots
-         |WHERE committed_at <= current_timestamp() - INTERVAL $minAgeMinutes MINUTES
-         |ORDER BY committed_at DESC LIMIT 1""".stripMargin).collect()
-    rows.headOption.map(_.getLong(0))
-  }
 
   private def leadKeyMax(
       spark: SparkSession,
@@ -398,15 +349,4 @@ object OptimizeTableCommand {
     rows.headOption.flatMap(r => Option(r.get(0)))
   }
 
-  /** Leading-key max as of a possibly-expired snapshot; None if the snapshot is gone. */
-  private def leadKeyMaxOrNone(
-      spark: SparkSession,
-      qualified: String,
-      key: String,
-      snapshotId: Long): Option[Any] =
-    try {
-      leadKeyMax(spark, qualified, key, Some(snapshotId))
-    } catch {
-      case NonFatal(_) => None // expired watermark -> fall back to a full backfill up to the floor
-    }
 }

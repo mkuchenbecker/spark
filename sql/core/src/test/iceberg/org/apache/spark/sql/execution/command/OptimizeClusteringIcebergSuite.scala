@@ -201,7 +201,7 @@ class OptimizeClusteringIcebergSuite extends QueryTest with SharedSparkSession {
     // z-order on decimal fails inside every rewrite group; partial progress would otherwise make
     // this a silent no-op. The command must surface a clear no-progress error instead.
     val e = intercept[Exception](sql(s"OPTIMIZE $t FULL").collect())
-    assert(messageChain(e).contains("committed no snapshot"),
+    assert(messageChain(e).contains("clustered no data"),
       s"expected a clear no-progress error, got: ${messageChain(e).take(300)}")
     assert(hwm(t).isEmpty, "watermark must not advance on a failed clustering run")
   }
