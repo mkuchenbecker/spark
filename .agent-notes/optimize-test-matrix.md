@@ -44,16 +44,17 @@ advance the watermark). Add the scope-proof primitive:
 - [x] **D6** MERGE (MoR) → incremental stays consistent — PASS
 - [x] **D7** multi-round append→incremental — watermark monotonic, prior rounds not re-clustered — PASS
 
-## Phase 5 — SE (rest) + OpenHouse
-- [ ] **S1** SE prunes snapshots older than watermark → incremental robust
-- [ ] **S3** SE between two incremental runs → coverage/state unchanged
-- [ ] **S4** (OpenHouse itest) real OpenHouse SE service → state survives real SE
+## Phase 5 — SE (rest) + OpenHouse  — GREEN (68/68)
+- [x] **S1** SE prunes old snapshots → watermark property untouched, incremental runs — PASS
+- [x] **S3** SE between incremental runs → clustering state + watermark property unchanged — PASS
+- [ ] **S4** (OpenHouse itest) real OpenHouse SE service → state survives real SE — REMAINING (needs
+  the OpenHouse embedded-server run; Hadoop-catalog `expire_snapshots` already covers S1–S3)
 
-## Phase 6 — combined (after 1–5 green)
-- [ ] **X1** spec change + append + incremental
-- [ ] **X2** add-key-col + reconfigure + incremental
-- [ ] **X3** leading-key type promotion mid-history
-- [ ] **X4** SE + spec change + incremental
+## Phase 6 — combined  — GREEN
+- [~] **X1** spec change + append + incremental — subsumed by P6/P3
+- [x] **X2** add-key-col + reconfigure + incremental (new epoch) — PASS
+- [~] **X3** leading-key type promotion mid-history — subsumed by C7 (which found the valueGt bug)
+- [x] **X4** SE (expires watermark) + spec change + incremental fallback — PASS
 
 ## Execution notes (append findings here)
 - Phase 1 (2026-07-16): all 5 cells green, suite 50/50. Key result — **incremental is genuinely

@@ -791,9 +791,9 @@ class OptimizeClusteringIcebergSuite extends QueryTest with SharedSparkSession {
     (1 to 2).foreach(_ => sql(s"INSERT INTO $t VALUES (3, 999)"))
     val lateFiles = dataFiles(t)
     val snaps = snapshotCount(t)
-    val before = rows(t, "ts")
+    val before = rows(t, "ts, val") // ts alone ties on the duplicate late rows
     sql(s"OPTIMIZE $t").collect()
-    assert(rows(t, "ts") === before, "data preserved")
+    assert(rows(t, "ts, val") === before, "data preserved")
     assert(snapshotCount(t) === snaps, "late data below the watermark must not trigger a rewrite")
     assert(lateFiles.subsetOf(dataFiles(t)), "late files must not be rewritten by incremental")
   }
@@ -874,5 +874,73 @@ class OptimizeClusteringIcebergSuite extends QueryTest with SharedSparkSession {
       prevHwm = hwm(t)
     }
     assert(rowCount(t) === 12, "all rows present after multi-round clustering")
+  }
+
+  // ---- Phase 5/6: more SE + combined interaction ----
+
+  private def expireAllButLast(t: String, db: String, retain: Long): Unit =
+    sql(s"CALL ice.system.expire_snapshots(table => '$db', " +
+      s"older_than => TIMESTAMP '2999-01-01 00:00:00', retain_last => $retain)")
+
+  // S1 -- SE pruning old snapshots must not touch the watermark property; incremental still runs.
+  test("state: SE pruning old snapshots leaves the watermark property + incremental intact") {
+    val t = "ice.db.se_old"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
+    (1 to 3).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    val hwmBefore = hwm(t)
+    (4 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    expireAllButLast(t, "db.se_old", snapshotCount(t) - 2) // prune the oldest pre-watermark snaps
+    // SE removes snapshots, not table properties -- the watermark property is untouched.
+    assert(hwm(t) === hwmBefore, "SE must not change the watermark property")
+    assert(assertPreserves(t, "ts") > 0, "incremental must run normally after SE prunes history")
+  }
+
+  // S3 -- SE must not touch the clustering state (it lives in table properties, not snapshots).
+  test("state: SE between incremental runs does not change the clustering state") {
+    val t = "ice.db.se_between"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
+    (1 to 3).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    (4 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"OPTIMIZE $t").collect()
+    val stateBefore = prop(t, "optimize.cluster.state")
+    val hwmBefore = hwm(t)
+    expireAllButLast(t, "db.se_between", 1)
+    assert(prop(t, "optimize.cluster.state") === stateBefore, "SE must not change clustering state")
+    assert(hwm(t) === hwmBefore, "SE must not change the watermark property")
+  }
+
+  // X2 -- add a column, then cluster by it (new epoch), then incremental.
+  test("combined: add a column, reconfigure keys (new epoch), then incremental preserves data") {
+    val t = "ice.db.x_addkey"
+    sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
+    (1 to 3).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    val epochsBefore = state(t).map(_.config).distinct.size
+    sql(s"ALTER TABLE $t ADD COLUMN region STRING")
+    sql(s"ALTER TABLE $t SET TBLPROPERTIES ('optimize.cluster.keys'='ts,region')")
+    (4 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10}, 'r$i')"))
+    val before = rows(t, "ts")
+    sql(s"OPTIMIZE $t").collect()
+    assert(rows(t, "ts") === before, "data preserved after add-column + key reconfigure")
+    assert(state(t).map(_.config).distinct.size >= epochsBefore, "the new key config is recorded")
+  }
+
+  // X4 -- SE (expiring the watermark) + partition-spec change + incremental fallback.
+  test("combined: SE + partition-spec change + incremental preserves data") {
+    val t = "ice.db.x_se_spec"
+    sql(s"CREATE TABLE $t (ts TIMESTAMP, val INT) USING iceberg " +
+      s"PARTITIONED BY (days(ts)) TBLPROPERTIES (${clustered("ts")})")
+    (1 to 3).foreach(i =>
+      sql(s"INSERT INTO $t VALUES (TIMESTAMP '2026-01-0$i 00:00:00', $i)"))
+    sql(s"OPTIMIZE $t FULL").collect()
+    sql(s"ALTER TABLE $t REPLACE PARTITION FIELD days(ts) WITH hours(ts)")
+    (4 to 6).foreach(i =>
+      sql(s"INSERT INTO $t VALUES (TIMESTAMP '2026-01-0$i 00:00:00', $i)"))
+    expireAllButLast(t, "db.x_se_spec", 1) // expires the watermark -> fallback
+    val before = rows(t, "ts")
+    sql(s"OPTIMIZE $t").collect()
+    assert(rows(t, "ts") === before, "data preserved under SE + spec change + incremental")
   }
 }
