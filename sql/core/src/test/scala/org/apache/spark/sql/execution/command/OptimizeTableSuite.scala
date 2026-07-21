@@ -53,11 +53,12 @@ class OptimizeTableSuite extends SparkFunSuite {
     assert(configId(Seq("ts"), "zorder") !== configId(Seq("ts"), "sort"))
   }
 
-  test("state: render/parse round-trips, including the optional lower bound") {
-    val intervals = Seq(
+  test("state: parses the serialized interval JSON, with and without the optional lower bound") {
+    val json = """[{"config":"c1","keys":"ts","mode":"sort","lower":"10","upper":"20"},""" +
+      """{"config":"c2","keys":"ts,uid","mode":"zorder","upper":"2026-01-06 00:00:00"}]"""
+    assert(parseState(json) === Seq(
       ClusterInterval("c1", "ts", "sort", Some("10"), "20"),
-      ClusterInterval("c2", "ts,uid", "zorder", None, "2026-01-06 00:00:00"))
-    assert(parseState(renderState(intervals)) === intervals)
+      ClusterInterval("c2", "ts,uid", "zorder", None, "2026-01-06 00:00:00")))
   }
 
   test("state: empty or absent input parses as no state") {

@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.execution.command
 
+import scala.collection.JavaConverters._
 import scala.collection.mutable
 
 import org.apache.spark.sql.{Row, SparkSession}
@@ -46,7 +47,7 @@ case class AnalyzeClusteringQualityCommand(nameParts: Seq[String]) extends LeafR
 
   import AnalyzeClusteringQualityCommand._
   import OptimizeTableCommand.{KEYS_PROP, SORT_MODE_PROP, STATE_PROP, HWM_PROP,
-    DEFAULT_SORT_MODE, configId, parseState, tableProperties}
+    DEFAULT_SORT_MODE, configId, parseState}
 
   override lazy val output: Seq[Attribute] = Seq(
     AttributeReference("metric", StringType, nullable = false)(),
@@ -65,27 +66,24 @@ case class AnalyzeClusteringQualityCommand(nameParts: Seq[String]) extends LeafR
     val tableArg = table.map(quoteIfNeeded).mkString(".")
     val qualifiedTableName = s"$cat.$tableArg"
 
-    val props = tableProperties(
-      catalogManager.catalog(catalog).asTableCatalog,
-      Identifier.of(table.init.toArray, table.last))
+    val props = catalogManager.catalog(catalog).asTableCatalog
+      .loadTable(Identifier.of(table.init.toArray, table.last)).properties().asScala.toMap
     val keys = props.get(KEYS_PROP)
       .map(_.split(",").map(_.trim).filter(_.nonEmpty).toSeq).getOrElse(Seq.empty)
 
     val out = mutable.ArrayBuffer[Row]()
-    def emit(metric: String, value: String): Unit = out += Row(metric, null, value)
-    def emitDim(metric: String, dim: String, value: String): Unit = out += Row(metric, dim, value)
 
     if (keys.isEmpty) {
-      emit("clustering_configured", "false")
+      out += Row("clustering_configured", null, "false")
       return out.toSeq
     }
-    emit("clustering_configured", "true")
+    out += Row("clustering_configured", null, "true")
 
     val sortMode = props.getOrElse(SORT_MODE_PROP, DEFAULT_SORT_MODE)
     val cfgId = configId(keys, sortMode)
-    emit("config_id", cfgId)
-    emit("keys", keys.mkString(","))
-    emit("sort_mode", sortMode)
+    out += Row("config_id", null, cfgId)
+    out += Row("keys", null, keys.mkString(","))
+    out += Row("sort_mode", null, sortMode)
 
     val leadKey = keys.head
     val leadType = sparkSession.table(qualifiedTableName).schema(leadKey).dataType.sql
@@ -111,13 +109,13 @@ case class AnalyzeClusteringQualityCommand(nameParts: Seq[String]) extends LeafR
     val filesCovered = a.getLong(2)
     val bytesCovered = a.getLong(3)
     val nullBytes = a.getLong(4)
-    emit("files_total", filesTotal.toString)
-    emit("files_covered", filesCovered.toString)
-    emit("bytes_total", bytesTotal.toString)
-    emit("bytes_covered", bytesCovered.toString)
-    emit("coverage_bytes_pct", pct(bytesCovered, bytesTotal))
-    emit("coverage_files_pct", pct(filesCovered, filesTotal))
-    emit("null_bound_bytes_pct", pct(nullBytes, bytesTotal))
+    out += Row("files_total", null, filesTotal.toString)
+    out += Row("files_covered", null, filesCovered.toString)
+    out += Row("bytes_total", null, bytesTotal.toString)
+    out += Row("bytes_covered", null, bytesCovered.toString)
+    out += Row("coverage_bytes_pct", null, pct(bytesCovered, bytesTotal))
+    out += Row("coverage_files_pct", null, pct(filesCovered, filesTotal))
+    out += Row("null_bound_bytes_pct", null, pct(nullBytes, bytesTotal))
 
     // Depth per clustering dimension: global and over the covered region only (the SLA input).
     // Each is a windowed stabbing-count sweep over metadata, kept off the driver.
@@ -126,15 +124,16 @@ case class AnalyzeClusteringQualityCommand(nameParts: Seq[String]) extends LeafR
       val kHi = metricExpr(k, "upper_bound")
       val g = depthStats(sparkSession, qualifiedTableName, kLo, kHi, None)
       val c = depthStats(sparkSession, qualifiedTableName, kLo, kHi, Some(coveredExpr))
-      emitDim("depth_avg", k, fmt(g.avg))
-      emitDim("depth_p90", k, fmt(g.p90))
-      emitDim("depth_max", k, g.max.toString)
-      emitDim("depth_avg_covered", k, fmt(c.avg))
-      emitDim("depth_p90_covered", k, fmt(c.p90))
+      out += Row("depth_avg", k, fmt(g.avg))
+      out += Row("depth_p90", k, fmt(g.p90))
+      out += Row("depth_max", k, g.max.toString)
+      out += Row("depth_avg_covered", k, fmt(c.avg))
+      out += Row("depth_p90_covered", k, fmt(c.p90))
     }
 
-    emit("unclustered_tail_hours", tailHours(sparkSession, qualifiedTableName, props.get(HWM_PROP)))
-    emit("state", props.getOrElse(STATE_PROP, "[]"))
+    val tail = tailHours(sparkSession, qualifiedTableName, props.get(HWM_PROP))
+    out += Row("unclustered_tail_hours", null, tail)
+    out += Row("state", null, props.getOrElse(STATE_PROP, "[]"))
     out.toSeq
   }
 }

@@ -95,10 +95,10 @@ case class OptimizeTableCommand(
 
     // Snapshot the physical layout before doing any work so we can report the reduction. This is
     // also the first table access, so a missing table fails here naming the table.
-    val filesBefore = dataFileCount(sparkSession, qualifiedTableName)
-    val snapshotsBefore = snapshotCount(sparkSession, qualifiedTableName)
+    val filesBefore = sparkSession.table(s"$qualifiedTableName.files").count()
+    val snapshotsBefore = sparkSession.table(s"$qualifiedTableName.snapshots").count()
 
-    val config = parseClusterConfig(tableProperties(tableCatalog, ident))
+    val config = parseClusterConfig(tableCatalog.loadTable(ident).properties().asScala.toMap)
 
     config.keys match {
       case Seq() =>
@@ -113,8 +113,8 @@ case class OptimizeTableCommand(
       sparkSession.sql(s"CALL $cat.system.rewrite_manifests(table => '$tableArg')").collect()
     }
 
-    val filesAfter = dataFileCount(sparkSession, qualifiedTableName)
-    val snapshotsAfter = snapshotCount(sparkSession, qualifiedTableName)
+    val filesAfter = sparkSession.table(s"$qualifiedTableName.files").count()
+    val snapshotsAfter = sparkSession.table(s"$qualifiedTableName.snapshots").count()
     Seq(
       Row("files_before", filesBefore.toString),
       Row("files_after", filesAfter.toString),
@@ -150,7 +150,9 @@ case class OptimizeTableCommand(
     // bound is the max value present as of the age floor; Iceberg satisfies this from manifest
     // metrics (aggregate pushdown) when the table has no deletes, so it is metadata-only.
     val leadKey = keys.head
-    val floorMax = leadKeyMax(spark, qualifiedTableName, leadKey, Some(floorId))
+    val floorMax = Option(
+      spark.read.option("snapshot-id", floorId).table(qualifiedTableName)
+        .agg(max(col(quoteIfNeeded(leadKey)))).head().get(0))
     if (floorMax.isEmpty) return // no data as of the age floor -> no-op
 
     // Lower bound: incremental runs skip what a prior run already clustered -- the last-clustered
@@ -195,7 +197,7 @@ case class OptimizeTableCommand(
     // rewrite over the non-empty scope, so a healthy run always commits a snapshot; if none is
     // committed the rewrite failed systemically (partial progress swallows per-group failures), so
     // fail loudly and leave the watermark unadvanced for a retry.
-    val snapshotsBefore = snapshotCount(spark, qualifiedTableName)
+    val snapshotsBefore = spark.table(s"$qualifiedTableName.snapshots").count()
     spark.sql(
       s"CALL $cat.system.rewrite_data_files(" +
         s"table => '$tableArg', " +
@@ -208,11 +210,11 @@ case class OptimizeTableCommand(
         "'use-starting-sequence-number', 'true', " +
         "'partial-progress.enabled', 'true', " +
         s"'partial-progress.max-commits', '$maxCommits'))").collect()
-    if (snapshotCount(spark, qualifiedTableName) <= snapshotsBefore) {
+    if (spark.table(s"$qualifiedTableName.snapshots").count() <= snapshotsBefore) {
       throw new IllegalStateException(
-        s"OPTIMIZE clustered no data for '$qualifiedTableName' despite a non-empty scope: " +
-          s"z-order (sort-mode=$sortMode) cannot be applied to some column types (e.g. decimal). " +
-          s"Keys=[${keys.mkString(",")}], sort-mode=$sortMode.")
+        s"OPTIMIZE clustered no data for '$qualifiedTableName': the scoped rewrite " +
+          s"(keys=[${keys.mkString(",")}], sort-mode=$sortMode) committed no snapshot despite a " +
+          s"non-empty scope. The watermark was left unadvanced so the run can be retried.")
     }
 
     // Advance all clustering metadata in one atomic alterTable -- the watermark (the consumed age
@@ -223,7 +225,7 @@ case class OptimizeTableCommand(
     tableCatalog.alterTable(ident,
       TableChange.setProperty(HWM_PROP, floorId.toString),
       TableChange.setProperty(CONFIG_ID_PROP, cfgId),
-      TableChange.setProperty(STATE_PROP, renderState(newState)))
+      TableChange.setProperty(STATE_PROP, stateMapper.writeValueAsString(newState)))
   }
 }
 
@@ -265,14 +267,6 @@ object OptimizeTableCommand {
     hwm = props.get(HWM_PROP).map(_.toLong),
     state = parseState(props.getOrElse(STATE_PROP, "")))
 
-  /**
-   * Read a table's properties through the catalog API (`TableCatalog.loadTable(...).properties`)
-   * rather than `SHOW TBLPROPERTIES`, so the `optimize.cluster.*` metadata comes back as a typed
-   * map without a SQL round-trip and row parsing. Shared by OPTIMIZE and ANALYZE clustering.
-   */
-  def tableProperties(catalog: TableCatalog, ident: Identifier): Map[String, String] =
-    catalog.loadTable(ident).properties().asScala.toMap
-
   private val stateMapper = {
     val mapper = new ObjectMapper() with ClassTagExtensions
     mapper.registerModule(DefaultScalaModule)
@@ -285,7 +279,7 @@ object OptimizeTableCommand {
    * One clustered leading-key interval `(lower, upper]` under a specific key selection (`config`).
    * `lower = None` means unbounded below (a FULL / first backfill). Persisted, alongside the
    * watermark, in the `optimize.cluster.state` table property so it survives snapshot expiration.
-   * Serialized to / from that property by [[renderState]] / [[parseState]] via Jackson.
+   * Serialized to / from that property via Jackson (`stateMapper` / [[parseState]]).
    */
   case class ClusterInterval(
       config: String, keys: String, mode: String, lower: Option[String], upper: String)
@@ -297,10 +291,6 @@ object OptimizeTableCommand {
     crc.update(normalized.getBytes(StandardCharsets.UTF_8))
     java.lang.Long.toHexString(crc.getValue)
   }
-
-  /** Serialize interval state to the JSON stored in `optimize.cluster.state`. For testing. */
-  def renderState(intervals: Seq[ClusterInterval]): String =
-    stateMapper.writeValueAsString(intervals)
 
   /**
    * Parse interval state. Empty / absent input is no state (a fresh table). Non-empty but
@@ -343,22 +333,6 @@ object OptimizeTableCommand {
       case (false, Some(cur)) => others :+ cur.copy(keys = keysStr, mode = mode, upper = upper)
       case (false, None) => existing :+ ClusterInterval(cfgId, keysStr, mode, lower, upper)
     }
-  }
-
-  private def snapshotCount(spark: SparkSession, qualifiedTableName: String): Long =
-    spark.table(s"$qualifiedTableName.snapshots").count()
-
-  private def dataFileCount(spark: SparkSession, qualifiedTableName: String): Long =
-    spark.table(s"$qualifiedTableName.files").count()
-
-  private def leadKeyMax(
-      spark: SparkSession,
-      qualifiedTableName: String,
-      key: String,
-      snapshotId: Option[Long]): Option[Any] = {
-    val reader = snapshotId.foldLeft(spark.read)((r, id) => r.option("snapshot-id", id))
-    val row = reader.table(qualifiedTableName).agg(max(col(quoteIfNeeded(key)))).head()
-    Option(row.get(0))
   }
 
 }
