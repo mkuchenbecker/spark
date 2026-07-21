@@ -22,6 +22,9 @@ import scala.collection.mutable
 import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Literal}
 import org.apache.spark.sql.catalyst.util.quoteIfNeeded
+import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
+import org.apache.spark.sql.connector.catalog.Identifier
+import org.apache.spark.sql.functions.col
 import org.apache.spark.sql.types.StringType
 
 /**
@@ -62,7 +65,9 @@ case class AnalyzeClusteringQualityCommand(nameParts: Seq[String]) extends LeafR
     val tableArg = table.map(quoteIfNeeded).mkString(".")
     val qualifiedTableName = s"$cat.$tableArg"
 
-    val props = tableProperties(catalogManager, catalog, table)
+    val props = tableProperties(
+      catalogManager.catalog(catalog).asTableCatalog,
+      Identifier.of(table.init.toArray, table.last))
     val keys = props.get(KEYS_PROP)
       .map(_.split(",").map(_.trim).filter(_.nonEmpty).toSeq).getOrElse(Seq.empty)
 
@@ -209,9 +214,8 @@ object AnalyzeClusteringQualityCommand {
     hwm match {
       case None => "unknown"
       case Some(h) =>
-        val floor = spark.sql(
-          s"SELECT committed_at FROM $qualifiedTableName.snapshots WHERE snapshot_id = $h")
-          .collect()
+        val floor = spark.table(s"$qualifiedTableName.snapshots")
+          .where(col("snapshot_id") === h.toLong).select("committed_at").collect()
         if (floor.isEmpty) return "unknown" // expired watermark
         val rows = spark.sql(
           s"""SELECT CAST((unix_timestamp(current_timestamp()) -

@@ -31,9 +31,9 @@ import com.fasterxml.jackson.module.scala.{ClassTagExtensions, DefaultScalaModul
 import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Literal}
 import org.apache.spark.sql.catalyst.util.quoteIfNeeded
-import org.apache.spark.sql.connector.catalog.{CatalogManager, Identifier}
+import org.apache.spark.sql.connector.catalog.{Identifier, TableCatalog, TableChange}
 import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
-import org.apache.spark.sql.functions.{col, lit}
+import org.apache.spark.sql.functions.{col, current_timestamp, expr, lit, max}
 import org.apache.spark.sql.types.StringType
 
 /**
@@ -90,20 +90,22 @@ case class OptimizeTableCommand(
     val cat = quoteIfNeeded(catalog)
     val tableArg = table.map(quoteIfNeeded).mkString(".")
     val qualifiedTableName = s"$cat.$tableArg"
+    val tableCatalog = catalogManager.catalog(catalog).asTableCatalog
+    val ident = Identifier.of(table.init.toArray, table.last)
 
     // Snapshot the physical layout before doing any work so we can report the reduction. This is
     // also the first table access, so a missing table fails here naming the table.
     val filesBefore = dataFileCount(sparkSession, qualifiedTableName)
     val snapshotsBefore = snapshotCount(sparkSession, qualifiedTableName)
 
-    val config = parseClusterConfig(tableProperties(catalogManager, catalog, table))
+    val config = parseClusterConfig(tableProperties(tableCatalog, ident))
 
     config.keys match {
       case Seq() =>
         // No clustering configured: plain bin-pack compaction (unchanged historical behavior).
         sparkSession.sql(s"CALL $cat.system.rewrite_data_files(table => '$tableArg')").collect()
       case _ =>
-        cluster(sparkSession, cat, tableArg, qualifiedTableName, config)
+        cluster(sparkSession, cat, tableArg, qualifiedTableName, tableCatalog, ident, config)
     }
 
     if (rewriteManifests) {
@@ -125,15 +127,19 @@ case class OptimizeTableCommand(
       cat: String,
       tableArg: String,
       qualifiedTableName: String,
+      tableCatalog: TableCatalog,
+      ident: Identifier,
       config: ClusterConfig): Unit = {
     import config.{hwm, keys, maxCommits, minAgeMinutes, sortMode, state}
 
     // Age floor: the newest snapshot at least `minAgeMinutes` old, by commit time. Everything
     // younger is held back so we never rewrite files a concurrent streaming writer is extending.
-    val ageFloor = spark.sql(
-      s"""SELECT snapshot_id FROM $qualifiedTableName.snapshots
-         |WHERE committed_at <= current_timestamp() - INTERVAL $minAgeMinutes MINUTES
-         |ORDER BY committed_at DESC LIMIT 1""".stripMargin).collect().headOption.map(_.getLong(0))
+    val ageFloor = spark.table(s"$qualifiedTableName.snapshots")
+      .where(col("committed_at") <= current_timestamp() - expr(s"INTERVAL $minAgeMinutes MINUTES"))
+      .orderBy(col("committed_at").desc)
+      .limit(1)
+      .select("snapshot_id")
+      .collect().headOption.map(_.getLong(0))
     if (ageFloor.isEmpty) return // nothing old enough to consume yet -> no-op
 
     val floorId = ageFloor.get
@@ -209,15 +215,15 @@ case class OptimizeTableCommand(
           s"Keys=[${keys.mkString(",")}], sort-mode=$sortMode.")
     }
 
-    // Advance all clustering metadata in one ALTER TABLE -- the watermark (the consumed age floor,
-    // not head), the config id, and the interval state -- so they never disagree across a crash.
+    // Advance all clustering metadata in one atomic alterTable -- the watermark (the consumed age
+    // floor, not head), the config id, and the interval state -- so they never disagree across a
+    // crash. Setting properties via the catalog API avoids escaping the state JSON into SQL.
     val newState = advanceState(
       state, cfgId, keys, sortMode, lowerValue, floorMax.get.toString, full)
-    spark.sql(
-      s"ALTER TABLE $cat.$tableArg SET TBLPROPERTIES (" +
-        s"'$HWM_PROP' = '$floorId', " +
-        s"'$CONFIG_ID_PROP' = '$cfgId', " +
-        s"'$STATE_PROP' = ${Literal(renderState(newState)).sql})").collect()
+    tableCatalog.alterTable(ident,
+      TableChange.setProperty(HWM_PROP, floorId.toString),
+      TableChange.setProperty(CONFIG_ID_PROP, cfgId),
+      TableChange.setProperty(STATE_PROP, renderState(newState)))
   }
 }
 
@@ -264,11 +270,8 @@ object OptimizeTableCommand {
    * rather than `SHOW TBLPROPERTIES`, so the `optimize.cluster.*` metadata comes back as a typed
    * map without a SQL round-trip and row parsing. Shared by OPTIMIZE and ANALYZE clustering.
    */
-  def tableProperties(
-      catalogManager: CatalogManager, catalog: String, table: Seq[String]): Map[String, String] =
-    catalogManager.catalog(catalog).asTableCatalog
-      .loadTable(Identifier.of(table.init.toArray, table.last))
-      .properties().asScala.toMap
+  def tableProperties(catalog: TableCatalog, ident: Identifier): Map[String, String] =
+    catalog.loadTable(ident).properties().asScala.toMap
 
   private val stateMapper = {
     val mapper = new ObjectMapper() with ClassTagExtensions
@@ -343,20 +346,19 @@ object OptimizeTableCommand {
   }
 
   private def snapshotCount(spark: SparkSession, qualifiedTableName: String): Long =
-    spark.sql(s"SELECT count(*) FROM $qualifiedTableName.snapshots").collect().head.getLong(0)
+    spark.table(s"$qualifiedTableName.snapshots").count()
 
   private def dataFileCount(spark: SparkSession, qualifiedTableName: String): Long =
-    spark.sql(s"SELECT count(*) FROM $qualifiedTableName.files").collect().head.getLong(0)
+    spark.table(s"$qualifiedTableName.files").count()
 
   private def leadKeyMax(
       spark: SparkSession,
       qualifiedTableName: String,
       key: String,
       snapshotId: Option[Long]): Option[Any] = {
-    val asOf = snapshotId.map(s => s" VERSION AS OF $s").getOrElse("")
-    val rows = spark.sql(
-      s"SELECT max(${quoteIfNeeded(key)}) FROM $qualifiedTableName$asOf").collect()
-    rows.headOption.flatMap(r => Option(r.get(0)))
+    val reader = snapshotId.foldLeft(spark.read)((r, id) => r.option("snapshot-id", id))
+    val row = reader.table(qualifiedTableName).agg(max(col(quoteIfNeeded(key)))).head()
+    Option(row.get(0))
   }
 
 }
