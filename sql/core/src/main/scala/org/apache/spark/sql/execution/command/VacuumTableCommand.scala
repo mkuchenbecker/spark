@@ -51,48 +51,44 @@ case class VacuumTableCommand(
   override def run(sparkSession: SparkSession): Seq[Row] = {
     val conf = sparkSession.sessionState.conf
     val catalogManager = sparkSession.sessionState.catalogManager
+    // If the leading name part is a registered catalog, split it off; otherwise the whole name is
+    // under the current catalog.
     val (catalog, table) = nameParts match {
-      case head +: tail if tail.nonEmpty && catalogManager.isCatalogRegistered(head) =>
-        (head, tail)
+      case maybeCatalog +: rest
+          if rest.nonEmpty && catalogManager.isCatalogRegistered(maybeCatalog) =>
+        (maybeCatalog, rest)
       case _ =>
         (catalogManager.currentCatalog.name, nameParts)
     }
-    val cat = quoteIfNeeded(catalog)
+    val quotedCatalog = quoteIfNeeded(catalog)
     val tableArg = table.map(quoteIfNeeded).mkString(".")
-    val zone = ZoneId.of(conf.sessionLocalTimeZone)
-    val now = Instant.now()
 
-    // Snapshot expiration always runs. Procedure arguments must be foldable, so the retention
-    // window is resolved here to a literal `older_than` timestamp (now - n hours) in the session
-    // time zone rather than passed as a `current_timestamp()` expression, which CALL binding
-    // rejects. An explicit RETAIN overrides the conf default.
-    val expireCutoff = VacuumTableCommand.olderThan(
-      now, retainHours.getOrElse(conf.getConf(SQLConf.VACUUM_EXPIRE_SNAPSHOTS_RETAIN_HOURS)), zone)
+    // Procedure arguments must be foldable, so a retention window is resolved here to a literal
+    // `older_than` timestamp (now - n hours) rather than a `current_timestamp()` expression, which
+    // CALL binding rejects. The literal is rendered in the session time zone because the CALL's
+    // `TIMESTAMP '...'` literal is parsed back in that same zone, so the round-trip preserves the
+    // intended instant. An explicit RETAIN overrides the conf default.
+    val now = Instant.now()
+    val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
+      .withZone(ZoneId.of(conf.sessionLocalTimeZone))
+
+    // Snapshot expiration always runs.
+    val expireHours =
+      retainHours.getOrElse(conf.getConf(SQLConf.VACUUM_EXPIRE_SNAPSHOTS_RETAIN_HOURS))
+    val expireCutoff = formatter.format(now.minus(expireHours.toLong, ChronoUnit.HOURS))
     sparkSession.sql(
-      s"CALL $cat.system.expire_snapshots(" +
+      s"CALL $quotedCatalog.system.expire_snapshots(" +
         s"table => '$tableArg', older_than => TIMESTAMP '$expireCutoff')").collect()
 
     if (removeOrphanFiles) {
-      val orphanCutoff = VacuumTableCommand.olderThan(
-        now, retainHours.getOrElse(conf.getConf(SQLConf.VACUUM_REMOVE_ORPHAN_FILES_RETAIN_HOURS)),
-        zone)
+      // Runs after expiration so it deletes against the settled live-file set.
+      val orphanHours =
+        retainHours.getOrElse(conf.getConf(SQLConf.VACUUM_REMOVE_ORPHAN_FILES_RETAIN_HOURS))
+      val orphanCutoff = formatter.format(now.minus(orphanHours.toLong, ChronoUnit.HOURS))
       sparkSession.sql(
-        s"CALL $cat.system.remove_orphan_files(" +
+        s"CALL $quotedCatalog.system.remove_orphan_files(" +
           s"table => '$tableArg', older_than => TIMESTAMP '$orphanCutoff')").collect()
     }
     Seq.empty[Row]
-  }
-}
-
-object VacuumTableCommand {
-  private val timestampFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
-
-  /**
-   * Renders the `older_than` cutoff for a retention window of `retainHours` hours before `now`,
-   * as a literal timestamp string in the given time zone. Exposed for testing.
-   */
-  def olderThan(now: Instant, retainHours: Int, zone: ZoneId): String = {
-    val cutoff = now.minus(retainHours.toLong, ChronoUnit.HOURS)
-    timestampFormatter.withZone(zone).format(cutoff)
   }
 }
