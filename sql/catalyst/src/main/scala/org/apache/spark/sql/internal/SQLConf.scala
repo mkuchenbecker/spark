@@ -5388,6 +5388,27 @@ object SQLConf {
       .booleanConf
       .createWithDefault(true)
 
+  val VACUUM_EXPIRE_SNAPSHOTS_RETAIN_HOURS =
+    buildConf("spark.sql.vacuum.expireSnapshots.retainHours")
+      .doc("Default retention window, in hours, for the snapshot expiration that VACUUM always " +
+        "runs. Snapshots older than this are eligible for expiration when VACUUM is invoked " +
+        "without an explicit RETAIN clause. An explicit RETAIN n HOURS overrides it.")
+      .version("4.0.0")
+      .intConf
+      .checkValue(_ >= 0, "The retention window must not be negative")
+      .createWithDefault(120)
+
+  val VACUUM_REMOVE_ORPHAN_FILES_RETAIN_HOURS =
+    buildConf("spark.sql.vacuum.removeOrphanFiles.retainHours")
+      .doc("Default retention window, in hours, for the orphan-file deletion that VACUUM runs " +
+        "when REMOVE ORPHAN FILES is specified. Files older than this are eligible for deletion " +
+        "when VACUUM is invoked without an explicit RETAIN clause. An explicit RETAIN n HOURS " +
+        "overrides it. The default matches Iceberg's own safe retention default.")
+      .version("4.0.0")
+      .intConf
+      .checkValue(_ >= 0, "The retention window must not be negative")
+      .createWithDefault(72)
+
   val LEGACY_PERCENTILE_DISC_CALCULATION = buildConf("spark.sql.legacy.percentileDiscCalculation")
     .internal()
     .doc("If true, the old bogus percentile_disc calculation is used. The old calculation " +
