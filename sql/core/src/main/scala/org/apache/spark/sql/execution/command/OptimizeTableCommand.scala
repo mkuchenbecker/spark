@@ -21,6 +21,7 @@ import java.nio.charset.StandardCharsets
 import java.util.Locale
 import java.util.zip.CRC32
 
+import scala.collection.JavaConverters._
 import scala.util.control.NonFatal
 
 import com.fasterxml.jackson.annotation.JsonInclude
@@ -30,6 +31,8 @@ import com.fasterxml.jackson.module.scala.{ClassTagExtensions, DefaultScalaModul
 import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Literal}
 import org.apache.spark.sql.catalyst.util.quoteIfNeeded
+import org.apache.spark.sql.connector.catalog.{CatalogManager, Identifier}
+import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
 import org.apache.spark.sql.functions.{col, lit}
 import org.apache.spark.sql.types.StringType
 
@@ -93,9 +96,7 @@ case class OptimizeTableCommand(
     val filesBefore = dataFileCount(sparkSession, qualifiedTableName)
     val snapshotsBefore = snapshotCount(sparkSession, qualifiedTableName)
 
-    val props = sparkSession.sql(s"SHOW TBLPROPERTIES $qualifiedTableName").collect()
-      .map(r => r.getString(0) -> r.getString(1)).toMap
-    val config = parseClusterConfig(props)
+    val config = parseClusterConfig(tableProperties(catalogManager, catalog, table))
 
     config.keys match {
       case Seq() =>
@@ -258,6 +259,17 @@ object OptimizeTableCommand {
     hwm = props.get(HWM_PROP).map(_.toLong),
     state = parseState(props.getOrElse(STATE_PROP, "")))
 
+  /**
+   * Read a table's properties through the catalog API (`TableCatalog.loadTable(...).properties`)
+   * rather than `SHOW TBLPROPERTIES`, so the `optimize.cluster.*` metadata comes back as a typed
+   * map without a SQL round-trip and row parsing. Shared by OPTIMIZE and ANALYZE clustering.
+   */
+  def tableProperties(
+      catalogManager: CatalogManager, catalog: String, table: Seq[String]): Map[String, String] =
+    catalogManager.catalog(catalog).asTableCatalog
+      .loadTable(Identifier.of(table.init.toArray, table.last))
+      .properties().asScala.toMap
+
   private val stateMapper = {
     val mapper = new ObjectMapper() with ClassTagExtensions
     mapper.registerModule(DefaultScalaModule)
@@ -287,13 +299,23 @@ object OptimizeTableCommand {
   def renderState(intervals: Seq[ClusterInterval]): String =
     stateMapper.writeValueAsString(intervals)
 
-  /** Parse interval state; malformed or empty input is treated as no state. Exposed for testing. */
+  /**
+   * Parse interval state. Empty / absent input is no state (a fresh table). Non-empty but
+   * unparseable input is a corrupted property, not "no state" -- silently treating it as empty
+   * would make OPTIMIZE recluster from scratch and mis-report ANALYZE coverage, so it fails loudly
+   * naming the property and how to clear it. Exposed for testing.
+   */
   def parseState(json: String): Seq[ClusterInterval] = {
     if (json == null || json.trim.isEmpty) return Seq.empty
     try {
       stateMapper.readValue[Seq[ClusterInterval]](json)
     } catch {
-      case NonFatal(_) => Seq.empty
+      case NonFatal(e) =>
+        throw new IllegalStateException(
+          s"Malformed clustering state in table property '$STATE_PROP'; OPTIMIZE cannot tell " +
+            s"what is already clustered. Clear the clustering metadata and let the next OPTIMIZE " +
+            s"rebuild it: ALTER TABLE <table> UNSET TBLPROPERTIES " +
+            s"('$STATE_PROP', '$HWM_PROP', '$CONFIG_ID_PROP'). Value was: $json", e)
     }
   }
 

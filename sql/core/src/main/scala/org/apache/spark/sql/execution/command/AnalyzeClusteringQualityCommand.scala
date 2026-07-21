@@ -43,7 +43,7 @@ case class AnalyzeClusteringQualityCommand(nameParts: Seq[String]) extends LeafR
 
   import AnalyzeClusteringQualityCommand._
   import OptimizeTableCommand.{KEYS_PROP, SORT_MODE_PROP, STATE_PROP, HWM_PROP,
-    DEFAULT_SORT_MODE, configId, parseState}
+    DEFAULT_SORT_MODE, configId, parseState, tableProperties}
 
   override lazy val output: Seq[Attribute] = Seq(
     AttributeReference("metric", StringType, nullable = false)(),
@@ -62,8 +62,7 @@ case class AnalyzeClusteringQualityCommand(nameParts: Seq[String]) extends LeafR
     val tableArg = table.map(quoteIfNeeded).mkString(".")
     val qualifiedTableName = s"$cat.$tableArg"
 
-    val props = sparkSession.sql(s"SHOW TBLPROPERTIES $qualifiedTableName").collect()
-      .map(r => r.getString(0) -> r.getString(1)).toMap
+    val props = tableProperties(catalogManager, catalog, table)
     val keys = props.get(KEYS_PROP)
       .map(_.split(",").map(_.trim).filter(_.nonEmpty).toSeq).getOrElse(Seq.empty)
 

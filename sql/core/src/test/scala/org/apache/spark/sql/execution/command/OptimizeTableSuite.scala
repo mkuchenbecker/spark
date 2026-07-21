@@ -60,10 +60,15 @@ class OptimizeTableSuite extends SparkFunSuite {
     assert(parseState(renderState(intervals)) === intervals)
   }
 
-  test("state: malformed or empty input parses as no state") {
+  test("state: empty or absent input parses as no state") {
     assert(parseState("") === Seq.empty)
     assert(parseState(null) === Seq.empty)
-    assert(parseState("not json") === Seq.empty)
+  }
+
+  test("state: malformed input fails loudly with clear-the-property guidance") {
+    val e = intercept[IllegalStateException](parseState("not json"))
+    assert(e.getMessage.contains(STATE_PROP))
+    assert(e.getMessage.contains("UNSET TBLPROPERTIES"))
   }
 
   test("advanceState: first run creates an interval") {
