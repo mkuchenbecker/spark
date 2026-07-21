@@ -268,6 +268,8 @@ statement
         (AS? query)?                                                   #replaceTable
     | ANALYZE TABLE identifierReference partitionSpec? COMPUTE STATISTICS
         (simpleIdentifier | FOR COLUMNS identifierSeq | FOR ALL COLUMNS)?    #analyze
+    | ANALYZE TABLE identifierReference
+        COMPUTE CLUSTERING QUALITY                                    #analyzeClusteringQuality
     | ANALYZE TABLES ((FROM | IN) identifierReference)? COMPUTE STATISTICS
         (simpleIdentifier)?                                            #analyzeTables
     | ALTER TABLE identifierReference
@@ -399,6 +401,9 @@ statement
         LEFT_PAREN columns=columnCommentList RIGHT_PAREN               #commentColumn
     | COMMENT ON COLUMN columnComment                                  #commentColumn
     | REFRESH TABLE identifierReference                                #refreshTable
+    | OPTIMIZE identifierReference
+        (full=FULL)?
+        (rewriteManifests=REWRITE MANIFESTS)?                          #optimizeTable
     | REFRESH FUNCTION identifierReference                             #refreshFunction
     | REFRESH (stringLit | .*?)                                        #refreshResource
     | CACHE LAZY? TABLE identifierReference
@@ -2075,6 +2080,7 @@ ansiNonReserved
     | CLOSE
     | CLUSTER
     | CLUSTERED
+    | CLUSTERING
     | CODEGEN
     | COLLECTION
     | COLUMNS
@@ -2207,6 +2213,7 @@ ansiNonReserved
     | LONG
     | LOOP
     | MACRO
+    | MANIFESTS
     | MAP
     | MATCHED
     | MATCH_CONDITION
@@ -2239,6 +2246,7 @@ ansiNonReserved
     | NUMERIC
     | OF
     | OPEN
+    | OPTIMIZE
     | OPTION
     | OPTIONS
     | OUT
@@ -2261,6 +2269,7 @@ ansiNonReserved
     | PROPERTIES
     | PURGE
     | QUALIFY
+    | QUALITY
     | QUARTER
     | QUERY
     | RANGE
@@ -2285,6 +2294,7 @@ ansiNonReserved
     | RETURN
     | RETURNS
     | REVOKE
+    | REWRITE
     | RLIKE
     | ROLE
     | ROLES
@@ -2475,6 +2485,7 @@ nonReserved
     | CLOSE
     | CLUSTER
     | CLUSTERED
+    | CLUSTERING
     | CODEGEN
     | COLLATE
     | COLLATION
@@ -2639,6 +2650,7 @@ nonReserved
     | LONG
     | LOOP
     | MACRO
+    | MANIFESTS
     | MAP
     | MATCHED
     | MATCH_CONDITION
@@ -2675,6 +2687,7 @@ nonReserved
     | OFFSET
     | ONLY
     | OPEN
+    | OPTIMIZE
     | OPTION
     | OPTIONS
     | OR
@@ -2702,6 +2715,7 @@ nonReserved
     | PROPERTIES
     | PURGE
     | QUALIFY
+    | QUALITY
     | QUARTER
     | QUERY
     | RANGE
@@ -2728,6 +2742,7 @@ nonReserved
     | RETURN
     | RETURNS
     | REVOKE
+    | REWRITE
     | RLIKE
     | ROLE
     | ROLES

@@ -62,6 +62,7 @@ CLEAR	false
 CLOSE	false
 CLUSTER	false
 CLUSTERED	false
+CLUSTERING	false
 CODEGEN	false
 COLLATE	false
 COLLATION	false
@@ -233,6 +234,7 @@ LOGICAL	false
 LONG	false
 LOOP	false
 MACRO	false
+MANIFESTS	false
 MAP	false
 MATCHED	false
 MATCH_CONDITION	false
@@ -272,6 +274,7 @@ OFFSET	false
 ON	false
 ONLY	false
 OPEN	false
+OPTIMIZE	false
 OPTION	false
 OPTIONS	false
 OR	false
@@ -299,6 +302,7 @@ PROCEDURES	false
 PROPERTIES	false
 PURGE	false
 QUALIFY	false
+QUALITY	false
 QUARTER	false
 QUERY	false
 RANGE	false
@@ -325,6 +329,7 @@ RESTRICT	false
 RETURN	false
 RETURNS	false
 REVOKE	false
+REWRITE	false
 RIGHT	false
 ROLE	false
 ROLES	false
