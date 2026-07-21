@@ -300,13 +300,15 @@ class OptimizeClusteringIcebergSuite extends QueryTest with SharedSparkSession {
     assert(hwm(t) === h1, "watermark must not move on a no-op run")
   }
 
-  test("state: expired watermark falls back to a full backfill") {
+  test("state: a stale watermark snapshot-id is ignored, never read") {
     val t = "ice.db.st_exp"
     sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
     (1 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
-    // Point the watermark at a snapshot id that does not exist; the command must not throw.
+    // Point the watermark at a snapshot id that does not exist. The lower bound comes from interval
+    // state (not the watermark snapshot), so the command never reads that id and must not throw;
+    // with no prior state it clusters up to the age floor.
     sql(s"ALTER TABLE $t SET TBLPROPERTIES ('optimize.cluster.hwm-snapshot-id' = '999999')")
-    assert(assertPreserves(t, "ts") > 0, "an expired watermark must fall back to a full backfill")
+    assert(assertPreserves(t, "ts") > 0, "a bogus watermark must not prevent clustering")
     assert(hwm(t) !== Some("999999"), "watermark must be reset to a real snapshot")
   }
 
@@ -640,21 +642,24 @@ class OptimizeClusteringIcebergSuite extends QueryTest with SharedSparkSession {
     assert(rows(t, "ts") === before, "data must be preserved across a partition-transform change")
   }
 
-  // S2 -- REAL snapshot expiration of the watermark snapshot must fall back to a full backfill.
-  test("state: real snapshot expiration of the watermark falls back to a full backfill") {
+  // S2 -- REAL snapshot expiration of the watermark snapshot must NOT trigger a full backfill. The
+  // incremental lower bound is the last-clustered upper from the persisted interval state (a table
+  // property that survives SE), so the run stays incremental on the forward slice even though the
+  // watermark snapshot itself is gone.
+  test("state: incremental survives real SE of the watermark snapshot (no full backfill)") {
     val t = "ice.db.se_wm"
     sql(s"CREATE TABLE $t (ts INT, val INT) USING iceberg TBLPROPERTIES (${clustered("ts")})")
     (1 to 3).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
-    sql(s"OPTIMIZE $t FULL").collect()
+    sql(s"OPTIMIZE $t FULL").collect() // clusters ts in [1,3]; state upper = 3
     val expiredHwm = hwm(t)
-    (4 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
-    // Really expire every snapshot but the head -- including the one the watermark points at.
-    sql(s"CALL ice.system.expire_snapshots(table => 'db.se_wm', " +
-      s"older_than => TIMESTAMP '2999-01-01 00:00:00', retain_last => 1)")
-    val before = rows(t, "ts")
-    sql(s"OPTIMIZE $t").collect()
-    assert(rows(t, "ts") === before, "data preserved after real SE + fallback")
-    assert(hwm(t) !== expiredHwm, "watermark must be reset off the expired snapshot")
+    assertIncrementalScope(t, "ts") {
+      (4 to 6).foreach(i => sql(s"INSERT INTO $t VALUES ($i, ${i * 10})"))
+      // Really expire every snapshot but the head -- including the one the watermark points at.
+      sql(s"CALL ice.system.expire_snapshots(table => 'db.se_wm', " +
+        s"older_than => TIMESTAMP '2999-01-01 00:00:00', retain_last => 1)")
+    }
+    assert(hwm(t) !== expiredHwm, "watermark must advance off the expired snapshot")
+    assert(state(t).exists(_.upper == "6"), "state upper must advance to the new forward max")
   }
 
   // ---- Phase 2: column DDL between runs ----
@@ -927,7 +932,7 @@ class OptimizeClusteringIcebergSuite extends QueryTest with SharedSparkSession {
     assert(state(t).map(_.config).distinct.size >= epochsBefore, "the new key config is recorded")
   }
 
-  // X4 -- SE (expiring the watermark) + partition-spec change + incremental fallback.
+  // X4 -- SE (expiring the watermark) + partition-spec change + incremental (via persisted state).
   test("combined: SE + partition-spec change + incremental preserves data") {
     val t = "ice.db.x_se_spec"
     sql(s"CREATE TABLE $t (ts TIMESTAMP, val INT) USING iceberg " +
@@ -938,7 +943,7 @@ class OptimizeClusteringIcebergSuite extends QueryTest with SharedSparkSession {
     sql(s"ALTER TABLE $t REPLACE PARTITION FIELD days(ts) WITH hours(ts)")
     (4 to 6).foreach(i =>
       sql(s"INSERT INTO $t VALUES (TIMESTAMP '2026-01-0$i 00:00:00', $i)"))
-    expireAllButLast(t, "db.x_se_spec", 1) // expires the watermark -> fallback
+    expireAllButLast(t, "db.x_se_spec", 1) // expires the watermark -> incremental via state
     val before = rows(t, "ts")
     sql(s"OPTIMIZE $t").collect()
     assert(rows(t, "ts") === before, "data preserved under SE + spec change + incremental")

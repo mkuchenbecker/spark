@@ -60,9 +60,9 @@ case class AnalyzeClusteringQualityCommand(nameParts: Seq[String]) extends LeafR
     }
     val cat = quoteIfNeeded(catalog)
     val tableArg = table.map(quoteIfNeeded).mkString(".")
-    val qualified = s"$cat.$tableArg"
+    val qualifiedTableName = s"$cat.$tableArg"
 
-    val props = sparkSession.sql(s"SHOW TBLPROPERTIES $qualified").collect()
+    val props = sparkSession.sql(s"SHOW TBLPROPERTIES $qualifiedTableName").collect()
       .map(r => r.getString(0) -> r.getString(1)).toMap
     val keys = props.get(KEYS_PROP)
       .map(_.split(",").map(_.trim).filter(_.nonEmpty).toSeq).getOrElse(Seq.empty)
@@ -84,7 +84,7 @@ case class AnalyzeClusteringQualityCommand(nameParts: Seq[String]) extends LeafR
     emit("sort_mode", sortMode)
 
     val leadKey = keys.head
-    val leadType = sparkSession.table(qualified).schema(leadKey).dataType.sql
+    val leadType = sparkSession.table(qualifiedTableName).schema(leadKey).dataType.sql
     val current = parseState(props.getOrElse(STATE_PROP, "")).filter(_.config == cfgId)
 
     // Coverage: a file is covered iff its leading-key range fits inside a current-config interval.
@@ -101,7 +101,7 @@ case class AnalyzeClusteringQualityCommand(nameParts: Seq[String]) extends LeafR
          |FROM (SELECT file_size_in_bytes,
          |        coalesce($coveredExpr, false) AS cov,
          |        ($leadLo IS NULL OR $leadHi IS NULL) AS lead_null
-         |      FROM $qualified.files)""".stripMargin).collect().head
+         |      FROM $qualifiedTableName.files)""".stripMargin).collect().head
     val filesTotal = a.getLong(0)
     val bytesTotal = a.getLong(1)
     val filesCovered = a.getLong(2)
@@ -120,8 +120,8 @@ case class AnalyzeClusteringQualityCommand(nameParts: Seq[String]) extends LeafR
     keys.foreach { k =>
       val kLo = metricExpr(k, "lower_bound")
       val kHi = metricExpr(k, "upper_bound")
-      val g = depthStats(sparkSession, qualified, kLo, kHi, None)
-      val c = depthStats(sparkSession, qualified, kLo, kHi, Some(coveredExpr))
+      val g = depthStats(sparkSession, qualifiedTableName, kLo, kHi, None)
+      val c = depthStats(sparkSession, qualifiedTableName, kLo, kHi, Some(coveredExpr))
       emitDim("depth_avg", k, fmt(g.avg))
       emitDim("depth_p90", k, fmt(g.p90))
       emitDim("depth_max", k, g.max.toString)
@@ -129,7 +129,7 @@ case class AnalyzeClusteringQualityCommand(nameParts: Seq[String]) extends LeafR
       emitDim("depth_p90_covered", k, fmt(c.p90))
     }
 
-    emit("unclustered_tail_hours", tailHours(sparkSession, qualified, props.get(HWM_PROP)))
+    emit("unclustered_tail_hours", tailHours(sparkSession, qualifiedTableName, props.get(HWM_PROP)))
     emit("state", props.getOrElse(STATE_PROP, "[]"))
     out.toSeq
   }
@@ -178,7 +178,7 @@ object AnalyzeClusteringQualityCommand {
    */
   private def depthStats(
       spark: SparkSession,
-      qualified: String,
+      qualifiedTableName: String,
       loExpr: String,
       hiExpr: String,
       coveredFilter: Option[String]): DepthStats = {
@@ -186,9 +186,9 @@ object AnalyzeClusteringQualityCommand {
     val where = s"$loExpr IS NOT NULL AND $hiExpr IS NOT NULL $extra"
     val q =
       s"""WITH ev AS (
-         |  SELECT $loExpr AS pt, 1 AS delta FROM $qualified.files WHERE $where
+         |  SELECT $loExpr AS pt, 1 AS delta FROM $qualifiedTableName.files WHERE $where
          |  UNION ALL
-         |  SELECT $hiExpr AS pt, -1 AS delta FROM $qualified.files WHERE $where
+         |  SELECT $hiExpr AS pt, -1 AS delta FROM $qualifiedTableName.files WHERE $where
          |),
          |running AS (SELECT delta, sum(delta) OVER (ORDER BY pt, delta DESC) AS depth FROM ev)
          |SELECT coalesce(avg(CASE WHEN delta = 1 THEN CAST(depth AS DOUBLE) END), 0.0),
@@ -205,19 +205,21 @@ object AnalyzeClusteringQualityCommand {
    * after the watermark snapshot. `0` if nothing is newer than the watermark; `unknown` if the
    * watermark is unset or has been expired (so an SLA breach is never hidden).
    */
-  private def tailHours(spark: SparkSession, qualified: String, hwm: Option[String]): String = {
+  private def tailHours(
+      spark: SparkSession, qualifiedTableName: String, hwm: Option[String]): String = {
     hwm match {
       case None => "unknown"
       case Some(h) =>
         val floor = spark.sql(
-          s"SELECT committed_at FROM $qualified.snapshots WHERE snapshot_id = $h").collect()
+          s"SELECT committed_at FROM $qualifiedTableName.snapshots WHERE snapshot_id = $h")
+          .collect()
         if (floor.isEmpty) return "unknown" // expired watermark
         val rows = spark.sql(
           s"""SELECT CAST((unix_timestamp(current_timestamp()) -
              |  unix_timestamp(min(committed_at))) / 3600.0 AS DOUBLE)
-             |FROM $qualified.snapshots
+             |FROM $qualifiedTableName.snapshots
              |WHERE operation != 'replace'
-             |  AND committed_at > (SELECT committed_at FROM $qualified.snapshots
+             |  AND committed_at > (SELECT committed_at FROM $qualifiedTableName.snapshots
              |    WHERE snapshot_id = $h)""".stripMargin).collect()
         if (rows.isEmpty || rows.head.isNullAt(0)) "0.0" else fmt(rows.head.getDouble(0))
     }
