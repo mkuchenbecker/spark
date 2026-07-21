@@ -48,6 +48,7 @@ CHECK	false
 CLEAR	false
 CLUSTER	false
 CLUSTERED	false
+CLUSTERING	false
 CODEGEN	false
 COLLATE	false
 COLLATION	false
@@ -200,6 +201,7 @@ LOGICAL	false
 LONG	false
 LOOP	false
 MACRO	false
+MANIFESTS	false
 MAP	false
 MATCHED	false
 MERGE	false
@@ -230,6 +232,7 @@ OF	false
 OFFSET	false
 ON	false
 ONLY	false
+OPTIMIZE	false
 OPTION	false
 OPTIONS	false
 OR	false
@@ -254,6 +257,7 @@ PRIMARY	false
 PRINCIPALS	false
 PROPERTIES	false
 PURGE	false
+QUALITY	false
 QUARTER	false
 QUERY	false
 RANGE	false
@@ -279,6 +283,7 @@ RETAIN	false
 RETURN	false
 RETURNS	false
 REVOKE	false
+REWRITE	false
 RIGHT	false
 ROLE	false
 ROLES	false

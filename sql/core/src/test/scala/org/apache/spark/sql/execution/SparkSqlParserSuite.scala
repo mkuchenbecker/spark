@@ -1007,6 +1007,7 @@ class SparkSqlParserSuite extends AnalysisTest with SharedSparkSession {
           start = 0,
           stop = sql.length - 1))
     }
+  }
 
   test("VACUUM table") {
     assertEqual("VACUUM a.b.c",
@@ -1017,5 +1018,36 @@ class SparkSqlParserSuite extends AnalysisTest with SharedSparkSession {
       VacuumTableCommand(Seq("tbl"), removeOrphanFiles = false, retainHours = Some(24)))
     assertEqual("VACUUM a.b REMOVE ORPHAN FILES RETAIN 168 HOURS",
       VacuumTableCommand(Seq("a", "b"), removeOrphanFiles = true, retainHours = Some(168)))
+  }
+
+  test("new command keywords remain usable as identifiers (non-reserved)") {
+    // At scale, columns/tables named `files`, `quality`, `cluster`, etc. certainly exist; the new
+    // OPTIMIZE/VACUUM/ANALYZE keywords must stay non-reserved so existing SQL keeps parsing.
+    val words = Seq("optimize", "vacuum", "clustering", "quality", "files", "retain",
+      "remove", "orphan", "manifests", "rewrite")
+    words.foreach { w =>
+      parser.parsePlan(s"SELECT $w FROM t")          // column reference
+      parser.parsePlan(s"SELECT 1 AS $w")            // alias
+      parser.parsePlan(s"SELECT * FROM $w")          // table name
+      parser.parsePlan(s"SELECT t.$w FROM t")        // qualified reference
+    }
+  }
+
+  test("OPTIMIZE table") {
+    assertEqual("OPTIMIZE a.b.c",
+      OptimizeTableCommand(Seq("a", "b", "c"), full = false, rewriteManifests = false))
+    assertEqual("OPTIMIZE tbl FULL",
+      OptimizeTableCommand(Seq("tbl"), full = true, rewriteManifests = false))
+    assertEqual("OPTIMIZE tbl REWRITE MANIFESTS",
+      OptimizeTableCommand(Seq("tbl"), full = false, rewriteManifests = true))
+    assertEqual("OPTIMIZE tbl FULL REWRITE MANIFESTS",
+      OptimizeTableCommand(Seq("tbl"), full = true, rewriteManifests = true))
+  }
+
+  test("ANALYZE TABLE COMPUTE CLUSTERING QUALITY") {
+    assertEqual("ANALYZE TABLE a.b.c COMPUTE CLUSTERING QUALITY",
+      AnalyzeClusteringQualityCommand(Seq("a", "b", "c")))
+    assertEqual("ANALYZE TABLE tbl COMPUTE CLUSTERING QUALITY",
+      AnalyzeClusteringQualityCommand(Seq("tbl")))
   }
 }
