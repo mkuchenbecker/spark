@@ -194,6 +194,8 @@ statement
         comment                                                        #commentNamespace
     | COMMENT ON TABLE identifierReference IS comment                  #commentTable
     | REFRESH TABLE identifierReference                                #refreshTable
+    | VACUUM identifierReference (remove=REMOVE ORPHAN FILES)?
+        (RETAIN retainHours=INTEGER_VALUE HOURS)?                      #vacuumTable
     | REFRESH FUNCTION identifierReference                             #refreshFunction
     | REFRESH (stringLit | .*?)                                        #refreshResource
     | CACHE LAZY? TABLE identifierReference
@@ -1512,6 +1514,11 @@ ansiNonReserved
     | UNSET
     | UPDATE
     | USE
+    | FILES
+    | ORPHAN
+    | REMOVE
+    | RETAIN
+    | VACUUM
     | VALUES
     | VARCHAR
     | VERSION
@@ -1855,6 +1862,11 @@ nonReserved
     | UPDATE
     | USE
     | USER
+    | FILES
+    | ORPHAN
+    | REMOVE
+    | RETAIN
+    | VACUUM
     | VALUES
     | VARCHAR
     | VERSION

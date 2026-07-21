@@ -68,6 +68,19 @@ class SparkSqlAstBuilder extends AstBuilder {
   private val strLiteralDef = """(".*?[^\\]"|'.*?[^\\]'|[^ \n\r\t"']+)""".r
 
   /**
+   * Create a [[VacuumTableCommand]] logical plan. For example:
+   * {{{
+   *   VACUUM multi_part_name [REMOVE ORPHAN FILES] [RETAIN number HOURS]
+   * }}}
+   */
+  override def visitVacuumTable(ctx: VacuumTableContext): LogicalPlan = withOrigin(ctx) {
+    val removeOrphanFiles = ctx.remove != null
+    val retainHours = Option(ctx.retainHours).map(_.getText.toInt)
+    withIdentClause(ctx.identifierReference(), nameParts =>
+      VacuumTableCommand(nameParts, removeOrphanFiles, retainHours))
+  }
+
+  /**
    * Create a [[SetCommand]] logical plan.
    *
    * Note that we assume that everything after the SET keyword is assumed to be a part of the

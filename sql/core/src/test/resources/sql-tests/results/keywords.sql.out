@@ -108,6 +108,7 @@ FALSE	false
 FETCH	false
 FIELDS	false
 FILEFORMAT	false
+FILES	false
 FILTER	false
 FIRST	false
 FLOAT	false
@@ -198,6 +199,7 @@ OPTION	false
 OPTIONS	false
 OR	false
 ORDER	false
+ORPHAN	false
 OUT	false
 OUTER	false
 OUTPUTFORMAT	false
@@ -229,6 +231,7 @@ RECOVER	false
 REDUCE	false
 REFERENCES	false
 REFRESH	false
+REMOVE	false
 RENAME	false
 REPAIR	false
 REPEATABLE	false
@@ -236,6 +239,7 @@ REPLACE	false
 RESET	false
 RESPECT	false
 RESTRICT	false
+RETAIN	false
 REVOKE	false
 RIGHT	false
 ROLE	false
@@ -313,6 +317,7 @@ UPDATE	false
 USE	false
 USER	false
 USING	false
+VACUUM	false
 VALUES	false
 VARCHAR	false
 VERSION	false
