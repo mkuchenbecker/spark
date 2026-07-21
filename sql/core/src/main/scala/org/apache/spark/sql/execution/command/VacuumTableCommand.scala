@@ -23,6 +23,7 @@ import java.time.temporal.ChronoUnit
 
 import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.catalyst.util.quoteIfNeeded
+import org.apache.spark.sql.internal.SQLConf
 
 /**
  * The logical plan of the VACUUM command, which runs Iceberg table maintenance by
@@ -32,10 +33,11 @@ import org.apache.spark.sql.catalyst.util.quoteIfNeeded
  * }}}
  *
  * Snapshot expiration always runs. When `REMOVE ORPHAN FILES` is specified, orphan-file
- * deletion runs afterwards. When `RETAIN n HOURS` is specified it bounds both operations via the
- * procedures' `older_than` argument; otherwise each procedure falls back to its own
- * default (the table's snapshot-age property for expiration, and Iceberg's safe
- * retention default for orphan-file deletion).
+ * deletion runs afterwards so it cleans up against the settled live-file set. The retention
+ * window bounding both operations comes from `RETAIN n HOURS` when given; otherwise each
+ * operation falls back to its own SQL-conf default
+ * ([[SQLConf.VACUUM_EXPIRE_SNAPSHOTS_RETAIN_HOURS]] and
+ * [[SQLConf.VACUUM_REMOVE_ORPHAN_FILES_RETAIN_HOURS]]).
  *
  * The command is thin sugar: it resolves the target catalog and issues the equivalent
  * `CALL` statements, so procedure resolution, argument binding, and any catalog-side
@@ -47,6 +49,7 @@ case class VacuumTableCommand(
     retainHours: Option[Int]) extends LeafRunnableCommand {
 
   override def run(sparkSession: SparkSession): Seq[Row] = {
+    val conf = sparkSession.sessionState.conf
     val catalogManager = sparkSession.sessionState.catalogManager
     val (catalog, table) = nameParts match {
       case head +: tail if tail.nonEmpty && catalogManager.isCatalogRegistered(head) =>
@@ -54,16 +57,29 @@ case class VacuumTableCommand(
       case _ =>
         (catalogManager.currentCatalog.name, nameParts)
     }
-    // Procedure arguments must be foldable, so a RETAIN window is resolved here to a
-    // literal timestamp (now - n hours) in the session time zone rather than passed as
-    // a `current_timestamp()` expression, which the CALL binding rejects.
-    val olderThan = retainHours.map { hours =>
-      val zone = ZoneId.of(sparkSession.sessionState.conf.sessionLocalTimeZone)
-      val cutoff = Instant.now().minus(hours.toLong, ChronoUnit.HOURS)
-      VacuumTableCommand.timestampFormatter.withZone(zone).format(cutoff)
+    val cat = quoteIfNeeded(catalog)
+    val tableArg = table.map(quoteIfNeeded).mkString(".")
+    val zone = ZoneId.of(conf.sessionLocalTimeZone)
+    val now = Instant.now()
+
+    // Snapshot expiration always runs. Procedure arguments must be foldable, so the retention
+    // window is resolved here to a literal `older_than` timestamp (now - n hours) in the session
+    // time zone rather than passed as a `current_timestamp()` expression, which CALL binding
+    // rejects. An explicit RETAIN overrides the conf default.
+    val expireCutoff = VacuumTableCommand.olderThan(
+      now, retainHours.getOrElse(conf.getConf(SQLConf.VACUUM_EXPIRE_SNAPSHOTS_RETAIN_HOURS)), zone)
+    sparkSession.sql(
+      s"CALL $cat.system.expire_snapshots(" +
+        s"table => '$tableArg', older_than => TIMESTAMP '$expireCutoff')").collect()
+
+    if (removeOrphanFiles) {
+      val orphanCutoff = VacuumTableCommand.olderThan(
+        now, retainHours.getOrElse(conf.getConf(SQLConf.VACUUM_REMOVE_ORPHAN_FILES_RETAIN_HOURS)),
+        zone)
+      sparkSession.sql(
+        s"CALL $cat.system.remove_orphan_files(" +
+          s"table => '$tableArg', older_than => TIMESTAMP '$orphanCutoff')").collect()
     }
-    VacuumTableCommand.callStatements(catalog, table, removeOrphanFiles, olderThan)
-      .foreach(stmt => sparkSession.sql(stmt).collect())
     Seq.empty[Row]
   }
 }
@@ -72,29 +88,11 @@ object VacuumTableCommand {
   private val timestampFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
 
   /**
-   * Builds the `CALL` statements that a VACUUM invocation expands into. Snapshot
-   * expiration is always emitted first; orphan-file deletion is appended when requested
-   * so it runs after expiration has settled the live file set. `olderThan`, when set, is
-   * a literal timestamp string that bounds both operations via the procedures'
-   * `older_than` argument. Exposed for testing.
+   * Renders the `older_than` cutoff for a retention window of `retainHours` hours before `now`,
+   * as a literal timestamp string in the given time zone. Exposed for testing.
    */
-  def callStatements(
-      catalog: String,
-      table: Seq[String],
-      removeOrphanFiles: Boolean,
-      olderThan: Option[String]): Seq[String] = {
-    val cat = quoteIfNeeded(catalog)
-    val tableArg = table.map(quoteIfNeeded).mkString(".")
-    val olderThanArg =
-      olderThan.map(ts => s", older_than => TIMESTAMP '$ts'").getOrElse("")
-    val expireSnapshots =
-      s"CALL $cat.system.expire_snapshots(table => '$tableArg'$olderThanArg)"
-    if (removeOrphanFiles) {
-      Seq(
-        expireSnapshots,
-        s"CALL $cat.system.remove_orphan_files(table => '$tableArg'$olderThanArg)")
-    } else {
-      Seq(expireSnapshots)
-    }
+  def olderThan(now: Instant, retainHours: Int, zone: ZoneId): String = {
+    val cutoff = now.minus(retainHours.toLong, ChronoUnit.HOURS)
+    timestampFormatter.withZone(zone).format(cutoff)
   }
 }

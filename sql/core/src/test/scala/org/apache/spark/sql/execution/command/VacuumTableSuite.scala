@@ -17,42 +17,23 @@
 
 package org.apache.spark.sql.execution.command
 
+import java.time.{Instant, ZoneId}
+
 import org.apache.spark.SparkFunSuite
 
 class VacuumTableSuite extends SparkFunSuite {
 
-  test("callStatements: snapshot expiration only, default retention") {
-    assert(
-      VacuumTableCommand.callStatements(
-        "cat", Seq("db", "t"), removeOrphanFiles = false, olderThan = None) ===
-      Seq("CALL cat.system.expire_snapshots(table => 'db.t')"))
+  private val ref = Instant.parse("2026-01-02T03:04:05Z")
+
+  test("olderThan: subtracts the retention window and renders millisecond precision") {
+    assert(VacuumTableCommand.olderThan(ref, 0, ZoneId.of("UTC")) === "2026-01-02 03:04:05.000")
+    assert(VacuumTableCommand.olderThan(ref, 24, ZoneId.of("UTC")) === "2026-01-01 03:04:05.000")
   }
 
-  test("callStatements: removeOrphanFiles appends remove_orphan_files after expiration") {
+  test("olderThan: renders the cutoff in the given time zone") {
+    // UTC-08:00 shifts the same instant back by 8 hours in wall-clock terms.
     assert(
-      VacuumTableCommand.callStatements(
-        "cat", Seq("db", "t"), removeOrphanFiles = true, olderThan = None) ===
-      Seq(
-        "CALL cat.system.expire_snapshots(table => 'db.t')",
-        "CALL cat.system.remove_orphan_files(table => 'db.t')"))
-  }
-
-  test("callStatements: older_than bounds both operations via a literal timestamp") {
-    assert(
-      VacuumTableCommand.callStatements(
-        "cat", Seq("db", "t"), removeOrphanFiles = true,
-        olderThan = Some("2026-01-01 00:00:00")) ===
-      Seq(
-        "CALL cat.system.expire_snapshots(table => 'db.t'," +
-          " older_than => TIMESTAMP '2026-01-01 00:00:00')",
-        "CALL cat.system.remove_orphan_files(table => 'db.t'," +
-          " older_than => TIMESTAMP '2026-01-01 00:00:00')"))
-  }
-
-  test("callStatements: quotes the catalog identifier when required") {
-    assert(
-      VacuumTableCommand.callStatements(
-        "my-cat", Seq("t"), removeOrphanFiles = false, olderThan = None) ===
-      Seq("CALL `my-cat`.system.expire_snapshots(table => 't')"))
+      VacuumTableCommand.olderThan(ref, 0, ZoneId.of("America/Los_Angeles")) ===
+        "2026-01-01 19:04:05.000")
   }
 }
