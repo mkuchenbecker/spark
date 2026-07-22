@@ -48,6 +48,7 @@ CHECK	true
 CLEAR	false
 CLUSTER	false
 CLUSTERED	false
+CLUSTERING	false
 CODEGEN	false
 COLLATE	true
 COLLATION	true
@@ -128,6 +129,7 @@ FALSE	true
 FETCH	true
 FIELDS	false
 FILEFORMAT	false
+FILES	false
 FILTER	true
 FIRST	false
 FLOAT	false
@@ -199,6 +201,7 @@ LOGICAL	false
 LONG	false
 LOOP	false
 MACRO	false
+MANIFESTS	false
 MAP	false
 MATCHED	false
 MERGE	false
@@ -229,10 +232,12 @@ OF	false
 OFFSET	true
 ON	true
 ONLY	true
+OPTIMIZE	false
 OPTION	false
 OPTIONS	false
 OR	true
 ORDER	true
+ORPHAN	false
 OUT	false
 OUTER	true
 OUTPUTFORMAT	false
@@ -252,6 +257,7 @@ PRIMARY	true
 PRINCIPALS	false
 PROPERTIES	false
 PURGE	false
+QUALITY	false
 QUARTER	false
 QUERY	false
 RANGE	false
@@ -264,6 +270,7 @@ RECURSIVE	true
 REDUCE	false
 REFERENCES	true
 REFRESH	false
+REMOVE	false
 RENAME	false
 REPAIR	false
 REPEAT	false
@@ -272,9 +279,11 @@ REPLACE	false
 RESET	false
 RESPECT	false
 RESTRICT	false
+RETAIN	false
 RETURN	false
 RETURNS	false
 REVOKE	false
+REWRITE	false
 RIGHT	true
 ROLE	false
 ROLES	false
@@ -359,6 +368,7 @@ UPDATE	false
 USE	false
 USER	true
 USING	true
+VACUUM	false
 VALUE	false
 VALUES	false
 VAR	false

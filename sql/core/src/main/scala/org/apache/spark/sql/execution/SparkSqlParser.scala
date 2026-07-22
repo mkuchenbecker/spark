@@ -87,6 +87,44 @@ class SparkSqlAstBuilder extends AstBuilder {
   }
 
   /**
+   * Create a [[VacuumTableCommand]] logical plan. For example:
+   * {{{
+   *   VACUUM multi_part_name [REMOVE ORPHAN FILES] [RETAIN number HOURS]
+   * }}}
+   */
+  override def visitVacuumTable(ctx: VacuumTableContext): LogicalPlan = withOrigin(ctx) {
+    val removeOrphanFiles = ctx.remove != null
+    val retainHours = Option(ctx.retainHours).map(_.getText.toInt)
+    withIdentClause(ctx.identifierReference(), nameParts =>
+      VacuumTableCommand(nameParts, removeOrphanFiles, retainHours))
+  }
+
+  /**
+   * Create an [[OptimizeTableCommand]] logical plan. For example:
+   * {{{
+   *   OPTIMIZE multi_part_name [FULL] [REWRITE MANIFESTS]
+   * }}}
+   */
+  override def visitOptimizeTable(ctx: OptimizeTableContext): LogicalPlan = withOrigin(ctx) {
+    val full = ctx.full != null
+    val rewriteManifests = ctx.rewriteManifests != null
+    withIdentClause(ctx.identifierReference(), nameParts =>
+      OptimizeTableCommand(nameParts, full, rewriteManifests))
+  }
+
+  /**
+   * Create an [[AnalyzeClusteringQualityCommand]] logical plan. For example:
+   * {{{
+   *   ANALYZE TABLE multi_part_name COMPUTE CLUSTERING QUALITY
+   * }}}
+   */
+  override def visitAnalyzeClusteringQuality(
+      ctx: AnalyzeClusteringQualityContext): LogicalPlan = withOrigin(ctx) {
+    withIdentClause(ctx.identifierReference(), nameParts =>
+      AnalyzeClusteringQualityCommand(nameParts))
+  }
+
+  /**
    * Create a [[SetCommand]] logical plan.
    *
    * Note that we assume that everything after the SET keyword is assumed to be a part of the

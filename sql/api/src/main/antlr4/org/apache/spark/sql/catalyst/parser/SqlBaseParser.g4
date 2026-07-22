@@ -217,6 +217,8 @@ statement
         (AS? query)?                                                   #replaceTable
     | ANALYZE TABLE identifierReference partitionSpec? COMPUTE STATISTICS
         (identifier | FOR COLUMNS identifierSeq | FOR ALL COLUMNS)?    #analyze
+    | ANALYZE TABLE identifierReference
+        COMPUTE CLUSTERING QUALITY                                    #analyzeClusteringQuality
     | ANALYZE TABLES ((FROM | IN) identifierReference)? COMPUTE STATISTICS
         (identifier)?                                                  #analyzeTables
     | ALTER TABLE identifierReference
@@ -321,6 +323,11 @@ statement
         comment                                                        #commentNamespace
     | COMMENT ON TABLE identifierReference IS comment                  #commentTable
     | REFRESH TABLE identifierReference                                #refreshTable
+    | VACUUM identifierReference (remove=REMOVE ORPHAN FILES)?
+        (RETAIN retainHours=INTEGER_VALUE HOURS)?                      #vacuumTable
+    | OPTIMIZE identifierReference
+        (full=FULL)?
+        (rewriteManifests=REWRITE MANIFESTS)?                          #optimizeTable
     | REFRESH FUNCTION identifierReference                             #refreshFunction
     | REFRESH (stringLit | .*?)                                        #refreshResource
     | CACHE LAZY? TABLE identifierReference
@@ -1630,6 +1637,7 @@ ansiNonReserved
     | CLEAR
     | CLUSTER
     | CLUSTERED
+    | CLUSTERING
     | CODEGEN
     | COLLECTION
     | COLUMNS
@@ -1746,6 +1754,7 @@ ansiNonReserved
     | LONG
     | LOOP
     | MACRO
+    | MANIFESTS
     | MAP
     | MATCHED
     | MERGE
@@ -1769,6 +1778,7 @@ ansiNonReserved
     | NULLS
     | NUMERIC
     | OF
+    | OPTIMIZE
     | OPTION
     | OPTIONS
     | OUT
@@ -1787,6 +1797,7 @@ ansiNonReserved
     | PRINCIPALS
     | PROPERTIES
     | PURGE
+    | QUALITY
     | QUARTER
     | QUERY
     | RANGE
@@ -1808,6 +1819,7 @@ ansiNonReserved
     | RETURN
     | RETURNS
     | REVOKE
+    | REWRITE
     | RLIKE
     | ROLE
     | ROLES
@@ -1881,6 +1893,11 @@ ansiNonReserved
     | UPDATE
     | USE
     | VALUE
+    | FILES
+    | ORPHAN
+    | REMOVE
+    | RETAIN
+    | VACUUM
     | VALUES
     | VARCHAR
     | VAR
@@ -1974,6 +1991,7 @@ nonReserved
     | CLEAR
     | CLUSTER
     | CLUSTERED
+    | CLUSTERING
     | CODEGEN
     | COLLATE
     | COLLATION
@@ -2118,6 +2136,7 @@ nonReserved
     | LONG
     | LOOP
     | MACRO
+    | MANIFESTS
     | MAP
     | MATCHED
     | MERGE
@@ -2145,6 +2164,7 @@ nonReserved
     | OF
     | OFFSET
     | ONLY
+    | OPTIMIZE
     | OPTION
     | OPTIONS
     | OR
@@ -2168,6 +2188,7 @@ nonReserved
     | PRINCIPALS
     | PROPERTIES
     | PURGE
+    | QUALITY
     | QUARTER
     | QUERY
     | RANGE
@@ -2191,6 +2212,7 @@ nonReserved
     | RETURN
     | RETURNS
     | REVOKE
+    | REWRITE
     | RLIKE
     | ROLE
     | ROLES
@@ -2274,6 +2296,11 @@ nonReserved
     | USE
     | USER
     | VALUE
+    | FILES
+    | ORPHAN
+    | REMOVE
+    | RETAIN
+    | VACUUM
     | VALUES
     | VARCHAR
     | VAR
